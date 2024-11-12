@@ -4,56 +4,87 @@
 //!
 //! Provides the [`Work`] and [`Target`] types that are used in proof-of-work calculations. The
 //! functions here are designed to be fast, by that we mean it is safe to use them to check headers.
-//!
 
-use core::fmt::{self, LowerHex, UpperHex};
 use core::ops::{Add, Div, Mul, Not, Rem, Shl, Shr, Sub};
+use core::{cmp, fmt};
 
+use internals::impl_to_hex_from_lower_hex;
 use io::{BufRead, Write};
 #[cfg(all(test, mutate))]
 use mutagen::mutate;
+use units::parse::{self, ParseIntError, PrefixedHexError, UnprefixedHexError};
 
-use crate::blockdata::block::BlockHash;
+use crate::block::{BlockHash, Header};
 use crate::consensus::encode::{self, Decodable, Encodable};
-#[cfg(doc)]
-use crate::consensus::Params;
-use crate::error::{PrefixedHexError, UnprefixedHexError, ContainsPrefixError, MissingPrefixError};
-use crate::{parse, Network};
+use crate::internal_macros::define_extension_trait;
+use crate::network::Params;
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(inline)]
+pub use primitives::CompactTarget;
 
 /// Implement traits and methods shared by `Target` and `Work`.
 macro_rules! do_impl {
     ($ty:ident) => {
         impl $ty {
-            /// Creates `Self` from a big-endian byte array.
+            #[doc = "Creates `"]
+            #[doc = stringify!($ty)]
+            #[doc = "` from a prefixed hex string."]
+            pub fn from_hex(s: &str) -> Result<Self, PrefixedHexError> {
+                Ok($ty(U256::from_hex(s)?))
+            }
+
+            #[doc = "Creates `"]
+            #[doc = stringify!($ty)]
+            #[doc = "` from an unprefixed hex string."]
+            pub fn from_unprefixed_hex(s: &str) -> Result<Self, UnprefixedHexError> {
+                Ok($ty(U256::from_unprefixed_hex(s)?))
+            }
+
+            #[doc = "Creates `"]
+            #[doc = stringify!($ty)]
+            #[doc = "` from a big-endian byte array."]
             #[inline]
             pub fn from_be_bytes(bytes: [u8; 32]) -> $ty { $ty(U256::from_be_bytes(bytes)) }
 
-            /// Creates `Self` from a little-endian byte array.
+            #[doc = "Creates `"]
+            #[doc = stringify!($ty)]
+            #[doc = "` from a little-endian byte array."]
             #[inline]
             pub fn from_le_bytes(bytes: [u8; 32]) -> $ty { $ty(U256::from_le_bytes(bytes)) }
 
-            /// Converts `self` to a big-endian byte array.
+            #[doc = "Converts `"]
+            #[doc = stringify!($ty)]
+            #[doc = "` to a big-endian byte array."]
             #[inline]
             pub fn to_be_bytes(self) -> [u8; 32] { self.0.to_be_bytes() }
 
-            /// Converts `self` to a little-endian byte array.
+            #[doc = "Converts `"]
+            #[doc = stringify!($ty)]
+            #[doc = "` to a little-endian byte array."]
             #[inline]
             pub fn to_le_bytes(self) -> [u8; 32] { self.0.to_le_bytes() }
         }
 
         impl fmt::Display for $ty {
             #[inline]
-            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result { fmt::Display::fmt(&self.0, f) }
+            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result {
+                fmt::Display::fmt(&self.0, f)
+            }
         }
 
         impl fmt::LowerHex for $ty {
             #[inline]
-            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
+            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result {
+                fmt::LowerHex::fmt(&self.0, f)
+            }
         }
 
         impl fmt::UpperHex for $ty {
             #[inline]
-            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result { fmt::UpperHex::fmt(&self.0, f) }
+            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result {
+                fmt::UpperHex::fmt(&self.0, f)
+            }
         }
     };
 }
@@ -63,7 +94,6 @@ macro_rules! do_impl {
 /// Work is a measure of how difficult it is to find a hash below a given [`Target`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct Work(U256);
 
 impl Work {
@@ -79,6 +109,7 @@ impl Work {
     pub fn log2(self) -> f64 { self.0.to_f64().log2() }
 }
 do_impl!(Work);
+impl_to_hex_from_lower_hex!(Work, |_| 64);
 
 impl Add for Work {
     type Output = Work;
@@ -99,7 +130,6 @@ impl Sub for Work {
 /// ref: <https://en.bitcoin.it/wiki/Target>
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct Target(U256);
 
 impl Target {
@@ -119,7 +149,7 @@ impl Target {
     /// The maximum **attainable** target value on mainnet.
     ///
     /// Not all target values are attainable because consensus code uses the compact format to
-    /// represent targets (see `CompactTarget`).
+    /// represent targets (see [`CompactTarget`]).
     pub const MAX_ATTAINABLE_MAINNET: Self = Target(U256(0xFFFF_u128 << (208 - 128), 0));
 
     /// The proof of work limit on testnet.
@@ -141,7 +171,7 @@ impl Target {
     ///
     /// ref: <https://developer.bitcoin.org/reference/block_chain.html#target-nbits>
     pub fn from_compact(c: CompactTarget) -> Target {
-        let bits = c.0;
+        let bits = c.to_consensus();
         // This is a floating-point "compact" encoding originally used by
         // OpenSSL, which satoshi put into consensus code, so we're stuck
         // with it. The exponent needs to have 3 subtracted from it, hence
@@ -181,7 +211,7 @@ impl Target {
             size += 1;
         }
 
-        CompactTarget(compact | (size << 24))
+        CompactTarget::from_consensus(compact | (size << 24))
     }
 
     /// Returns true if block hash is less than or equal to this [`Target`].
@@ -190,7 +220,6 @@ impl Target {
     /// to the target.
     #[cfg_attr(all(test, mutate), mutate)]
     pub fn is_met_by(&self, hash: BlockHash) -> bool {
-        use hashes::Hash;
         let hash = U256::from_le_bytes(hash.to_byte_array());
         hash <= self.0
     }
@@ -220,16 +249,18 @@ impl Target {
     /// integer but `difficulty()` returns only 128 bits this means for targets below approximately
     /// `0xffff_ffff_ffff_ffff_ffff_ffff` `difficulty()` will saturate at `u128::MAX`.
     ///
+    /// # Panics
+    ///
+    /// Panics if `self` is zero (divide by zero).
+    ///
     /// [max]: Target::max
-    /// [target]: crate::blockdata::block::Header::target
+    /// [target]: crate::block::HeaderExt::target
     #[cfg_attr(all(test, mutate), mutate)]
-    pub fn difficulty(&self, network: Network) -> u128 {
-        let max = match network {
-            Network::Bitcoin => Target::MAX_ATTAINABLE_MAINNET,
-            Network::Testnet => Target::MAX_ATTAINABLE_TESTNET,
-            Network::Signet => Target::MAX_ATTAINABLE_SIGNET,
-            Network::Regtest => Target::MAX_ATTAINABLE_REGTEST,
-        };
+    pub fn difficulty(&self, params: impl AsRef<Params>) -> u128 {
+        // Panic here may be eaiser to debug than during the actual division.
+        assert_ne!(self.0, U256::ZERO, "divide by zero");
+
+        let max = params.as_ref().max_attainable_target;
         let d = max.0 / self.0;
         d.saturating_to_u128()
     }
@@ -238,67 +269,170 @@ impl Target {
     ///
     /// See [`difficulty`] for details.
     ///
+    /// # Panics
+    ///
+    /// Panics if `self` is zero (divide by zero).
+    ///
     /// [`difficulty`]: Target::difficulty
     #[cfg_attr(all(test, mutate), mutate)]
-    pub fn difficulty_float(&self) -> f64 { TARGET_MAX_F64 / self.0.to_f64() }
+    pub fn difficulty_float(&self, params: impl AsRef<Params>) -> f64 {
+        // We want to explicitly panic to be uniform with `difficulty()`
+        // (float division by zero does not panic).
+        // Note, target 0 is basically impossible to obtain by any "normal" means.
+        assert_ne!(self.0, U256::ZERO, "divide by zero");
+        let max = params.as_ref().max_attainable_target;
+        max.0.to_f64() / self.0.to_f64()
+    }
+
+    /// Computes the minimum valid [`Target`] threshold allowed for a block in which a difficulty
+    /// adjustment occurs.
+    #[deprecated(since = "0.32.0", note = "use `min_transition_threshold` instead")]
+    pub fn min_difficulty_transition_threshold(&self) -> Self { self.min_transition_threshold() }
+
+    /// Computes the maximum valid [`Target`] threshold allowed for a block in which a difficulty
+    /// adjustment occurs.
+    #[deprecated(since = "0.32.0", note = "use `max_transition_threshold` instead")]
+    pub fn max_difficulty_transition_threshold(&self) -> Self {
+        self.max_transition_threshold_unchecked()
+    }
 
     /// Computes the minimum valid [`Target`] threshold allowed for a block in which a difficulty
     /// adjustment occurs.
     ///
     /// The difficulty can only decrease or increase by a factor of 4 max on each difficulty
     /// adjustment period.
-    pub fn min_difficulty_transition_threshold(&self) -> Self { Self(self.0 >> 2) }
+    ///
+    /// # Returns
+    ///
+    /// In line with Bitcoin Core this function may return a target value of zero.
+    pub fn min_transition_threshold(&self) -> Self { Self(self.0 >> 2) }
 
     /// Computes the maximum valid [`Target`] threshold allowed for a block in which a difficulty
     /// adjustment occurs.
     ///
     /// The difficulty can only decrease or increase by a factor of 4 max on each difficulty
     /// adjustment period.
-    pub fn max_difficulty_transition_threshold(&self) -> Self { Self(self.0 << 2) }
+    ///
+    /// We also check that the calculated target is not greater than the maximum allowed target,
+    /// this value is network specific - hence the `params` parameter.
+    pub fn max_transition_threshold(&self, params: impl AsRef<Params>) -> Self {
+        let max_attainable = params.as_ref().max_attainable_target;
+        cmp::min(self.max_transition_threshold_unchecked(), max_attainable)
+    }
+
+    /// Computes the maximum valid [`Target`] threshold allowed for a block in which a difficulty
+    /// adjustment occurs.
+    ///
+    /// The difficulty can only decrease or increase by a factor of 4 max on each difficulty
+    /// adjustment period.
+    ///
+    /// # Returns
+    ///
+    /// This function may return a value greater than the maximum allowed target for this network.
+    ///
+    /// The return value should be checked against [`Params::max_attainable_target`] or use one of
+    /// the `Target::MAX_ATTAINABLE_FOO` constants.
+    pub fn max_transition_threshold_unchecked(&self) -> Self { Self(self.0 << 2) }
 }
 do_impl!(Target);
+impl_to_hex_from_lower_hex!(Target, |_| 64);
 
-/// Encoding of 256-bit target as 32-bit float.
-///
-/// This is used to encode a target into the block header. Satoshi made this part of consensus code
-/// in the original version of Bitcoin, likely copying an idea from OpenSSL.
-///
-/// OpenSSL's bignum (BN) type has an encoding, which is even called "compact" as in bitcoin, which
-/// is exactly this format.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
-pub struct CompactTarget(u32);
-
-impl CompactTarget {
-    /// Creates a `CompactTarget` from an prefixed hex string.
-    pub fn from_hex(s: &str) -> Result<Self, PrefixedHexError> {
-        let stripped = if let Some(stripped) = s.strip_prefix("0x") {
-            stripped
-        } else if let Some(stripped) = s.strip_prefix("0X") {
-            stripped
-        } else {
-            return Err(MissingPrefixError::new(s).into());
-        };
-
-        let target = parse::hex_u32(stripped)?;
-        Ok(Self::from_consensus(target))
-    }
-
-    /// Creates a `CompactTarget` from an unprefixed hex string.
-    pub fn from_unprefixed_hex(s: &str) -> Result<Self, UnprefixedHexError> {
-        if s.starts_with("0x") || s.starts_with("0X") {
-            return Err(ContainsPrefixError::new(s).into());
+define_extension_trait! {
+    /// Extension functionality for the [`CompactTarget`] type.
+    pub trait CompactTargetExt impl for CompactTarget {
+        /// Constructs a new `CompactTarget` from a prefixed hex string.
+        fn from_hex(s: &str) -> Result<CompactTarget, PrefixedHexError> {
+            let target = parse::hex_u32_prefixed(s)?;
+            Ok(Self::from_consensus(target))
         }
-        let lock_time = parse::hex_u32(s)?;
-        Ok(Self::from_consensus(lock_time))
+
+        /// Constructs a new `CompactTarget` from an unprefixed hex string.
+        fn from_unprefixed_hex(s: &str) -> Result<CompactTarget, UnprefixedHexError> {
+            let target = parse::hex_u32_unprefixed(s)?;
+            Ok(Self::from_consensus(target))
+        }
+
+        /// Computes the [`CompactTarget`] from a difficulty adjustment.
+        ///
+        /// ref: <https://github.com/bitcoin/bitcoin/blob/0503cbea9aab47ec0a87d34611e5453158727169/src/pow.cpp>
+        ///
+        /// Given the previous Target, represented as a [`CompactTarget`], the difficulty is adjusted
+        /// by taking the timespan between them, and multipling the current [`CompactTarget`] by a factor
+        /// of the net timespan and expected timespan. The [`CompactTarget`] may not adjust by more than
+        /// a factor of 4, or adjust beyond the maximum threshold for the network.
+        ///
+        /// # Note
+        ///
+        /// Under the consensus rules, the difference in the number of blocks between the headers does
+        /// not equate to the `difficulty_adjustment_interval` of [`Params`]. This is due to an off-by-one
+        /// error, and, the expected number of blocks in between headers is `difficulty_adjustment_interval - 1`
+        /// when calculating the difficulty adjustment.
+        ///
+        /// Take the example of the first difficulty adjustment. Block 2016 introduces a new [`CompactTarget`],
+        /// which takes the net timespan between Block 2015 and Block 0, and recomputes the difficulty.
+        ///
+        /// # Returns
+        ///
+        /// The expected [`CompactTarget`] recalculation.
+        fn from_next_work_required(
+            last: CompactTarget,
+            timespan: u64,
+            params: impl AsRef<Params>,
+        ) -> CompactTarget {
+            let params = params.as_ref();
+            if params.no_pow_retargeting {
+                return last;
+            }
+            // Comments relate to the `pow.cpp` file from Core.
+            // ref: <https://github.com/bitcoin/bitcoin/blob/0503cbea9aab47ec0a87d34611e5453158727169/src/pow.cpp>
+            let min_timespan = params.pow_target_timespan >> 2; // Lines 56/57
+            let max_timespan = params.pow_target_timespan << 2; // Lines 58/59
+            let actual_timespan = timespan.clamp(min_timespan, max_timespan);
+            let prev_target: Target = last.into();
+            let maximum_retarget = prev_target.max_transition_threshold(params); // bnPowLimit
+            let retarget = prev_target.0; // bnNew
+            let retarget = retarget.mul(actual_timespan.into());
+            let retarget = retarget.div(params.pow_target_timespan.into());
+            let retarget = Target(retarget);
+            if retarget.ge(&maximum_retarget) {
+                return maximum_retarget.to_compact_lossy();
+            }
+            retarget.to_compact_lossy()
+        }
+
+        /// Computes the [`CompactTarget`] from a difficulty adjustment,
+        /// assuming these are the relevant block headers.
+        ///
+        /// Given two headers, representing the start and end of a difficulty adjustment epoch,
+        /// compute the [`CompactTarget`] based on the net time between them and the current
+        /// [`CompactTarget`].
+        ///
+        /// # Note
+        ///
+        /// See [`CompactTarget::from_next_work_required`]
+        ///
+        /// For example, to successfully compute the first difficulty adjustment on the Bitcoin network,
+        /// one would pass the header for Block 2015 as `current` and the header for Block 0 as
+        /// `last_epoch_boundary`.
+        ///
+        /// # Returns
+        ///
+        /// The expected [`CompactTarget`] recalculation.
+        fn from_header_difficulty_adjustment(
+            last_epoch_boundary: Header,
+            current: Header,
+            params: impl AsRef<Params>,
+        ) -> CompactTarget {
+            let timespan = current.time - last_epoch_boundary.time;
+            let bits = current.bits;
+            CompactTarget::from_next_work_required(bits, timespan.into(), params)
+        }
     }
+}
 
-    /// Creates a [`CompactTarget`] from a consensus encoded `u32`.
-    pub fn from_consensus(bits: u32) -> Self { Self(bits) }
-
-    /// Returns the consensus encoded `u32` representation of this [`CompactTarget`].
-    pub fn to_consensus(self) -> u32 { self.0 }
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::CompactTarget {}
 }
 
 impl From<CompactTarget> for Target {
@@ -308,25 +442,15 @@ impl From<CompactTarget> for Target {
 impl Encodable for CompactTarget {
     #[inline]
     fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
-        self.0.consensus_encode(w)
+        self.to_consensus().consensus_encode(w)
     }
 }
 
 impl Decodable for CompactTarget {
     #[inline]
     fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
-        u32::consensus_decode(r).map(CompactTarget)
+        u32::consensus_decode(r).map(CompactTarget::from_consensus)
     }
-}
-
-impl LowerHex for CompactTarget {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { LowerHex::fmt(&self.0, f) }
-}
-
-impl UpperHex for CompactTarget {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { UpperHex::fmt(&self.0, f) }
 }
 
 /// Big-endian 256 bit integer type.
@@ -342,7 +466,37 @@ impl U256 {
 
     const ONE: U256 = U256(0, 1);
 
-    /// Creates [`U256`] from a big-endian array of `u8`s.
+    /// Constructs a new `U256` from a prefixed hex string.
+    fn from_hex(s: &str) -> Result<Self, PrefixedHexError> {
+        let checked = parse::hex_remove_prefix(s)?;
+        Ok(U256::from_hex_internal(checked)?)
+    }
+
+    /// Constructs a new `U256` from an unprefixed hex string.
+    fn from_unprefixed_hex(s: &str) -> Result<Self, UnprefixedHexError> {
+        let checked = parse::hex_check_unprefixed(s)?;
+        Ok(U256::from_hex_internal(checked)?)
+    }
+
+    // Caller to ensure `s` does not contain a prefix.
+    fn from_hex_internal(s: &str) -> Result<Self, ParseIntError> {
+        let (high, low) = if s.len() <= 32 {
+            let low = parse::hex_u128_unchecked(s)?;
+            (0, low)
+        } else {
+            let high_len = s.len() - 32;
+            let high_s = &s[..high_len];
+            let low_s = &s[high_len..];
+
+            let high = parse::hex_u128_unchecked(high_s)?;
+            let low = parse::hex_u128_unchecked(low_s)?;
+            (high, low)
+        };
+
+        Ok(U256(high, low))
+    }
+
+    /// Constructs a new `U256` from a big-endian array of `u8`s.
     #[cfg_attr(all(test, mutate), mutate)]
     fn from_be_bytes(a: [u8; 32]) -> U256 {
         let (high, low) = split_in_half(a);
@@ -351,7 +505,7 @@ impl U256 {
         U256(big, little)
     }
 
-    /// Creates a [`U256`] from a little-endian array of `u8`s.
+    /// Constructs a new `U256` from a little-endian array of `u8`s.
     #[cfg_attr(all(test, mutate), mutate)]
     fn from_le_bytes(a: [u8; 32]) -> U256 {
         let (high, low) = split_in_half(a);
@@ -360,7 +514,7 @@ impl U256 {
         U256(big, little)
     }
 
-    /// Converts `Self` to a big-endian array of `u8`s.
+    /// Converts `U256` to a big-endian array of `u8`s.
     #[cfg_attr(all(test, mutate), mutate)]
     fn to_be_bytes(self) -> [u8; 32] {
         let mut out = [0; 32];
@@ -369,7 +523,7 @@ impl U256 {
         out
     }
 
-    /// Converts `Self` to a little-endian array of `u8`s.
+    /// Converts `U256` to a little-endian array of `u8`s.
     #[cfg_attr(all(test, mutate), mutate)]
     fn to_le_bytes(self) -> [u8; 32] {
         let mut out = [0; 32];
@@ -420,7 +574,7 @@ impl U256 {
     /// Returns the low 128 bits.
     fn low_u128(&self) -> u128 { self.1 }
 
-    /// Returns `self` as a `u128` saturating to `u128::MAX` if `self` is too big.
+    /// Returns this `U256` as a `u128` saturating to `u128::MAX` if `self` is too big.
     // Matagen gives false positive because >= and > both return u128::MAX
     fn saturating_to_u128(&self) -> u128 {
         if *self > U256::from(u128::MAX) {
@@ -728,35 +882,15 @@ impl U256 {
     }
 }
 
-// Target::MAX as a float value. Calculated with U256::to_f64.
-// This is validated in the unit tests as well.
-const TARGET_MAX_F64: f64 = 2.695953529101131e67;
-
 impl<T: Into<u128>> From<T> for U256 {
     fn from(x: T) -> Self { U256(0, x.into()) }
-}
-
-/// Error from `TryFrom<signed type>` implementations, occurs when input is negative.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct TryFromError(i128);
-
-impl fmt::Display for TryFromError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "attempt to create unsigned integer type from negative number: {}", self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for TryFromError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
 }
 
 impl Add for U256 {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
         let (res, overflow) = self.overflowing_add(rhs);
-        debug_assert!(!overflow, "Addition of U256 values overflowed");
+        debug_assert!(!overflow, "addition of U256 values overflowed");
         res
     }
 }
@@ -765,7 +899,7 @@ impl Sub for U256 {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
         let (res, overflow) = self.overflowing_sub(rhs);
-        debug_assert!(!overflow, "Subtraction of U256 values overflowed");
+        debug_assert!(!overflow, "subtraction of U256 values overflowed");
         res
     }
 }
@@ -774,7 +908,7 @@ impl Mul for U256 {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self {
         let (res, overflow) = self.overflowing_mul(rhs);
-        debug_assert!(!overflow, "Multiplication of U256 values overflowed");
+        debug_assert!(!overflow, "multiplication of U256 values overflowed");
         res
     }
 }
@@ -820,7 +954,7 @@ impl fmt::Debug for U256 {
 }
 
 macro_rules! impl_hex {
-    ($hex:ident, $case:expr) => {
+    ($hex:path, $case:expr) => {
         impl $hex for U256 {
             fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result {
                 hex::fmt_hex_exact!(f, 32, &self.to_be_bytes(), $case)
@@ -828,8 +962,8 @@ macro_rules! impl_hex {
         }
     };
 }
-impl_hex!(LowerHex, hex::Case::Lower);
-impl_hex!(UpperHex, hex::Case::Upper);
+impl_hex!(fmt::LowerHex, hex::Case::Lower);
+impl_hex!(fmt::UpperHex, hex::Case::Upper);
 
 #[cfg(feature = "serde")]
 impl crate::serde::Serialize for U256 {
@@ -862,7 +996,7 @@ impl<'de> crate::serde::Deserialize<'de> for U256 {
         if d.is_human_readable() {
             struct HexVisitor;
 
-            impl<'de> de::Visitor<'de> for HexVisitor {
+            impl de::Visitor<'_> for HexVisitor {
                 type Value = U256;
 
                 fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -902,7 +1036,7 @@ impl<'de> crate::serde::Deserialize<'de> for U256 {
         } else {
             struct BytesVisitor;
 
-            impl<'de> serde::de::Visitor<'de> for BytesVisitor {
+            impl serde::de::Visitor<'_> for BytesVisitor {
                 type Value = U256;
 
                 fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -947,8 +1081,12 @@ impl kani::Arbitrary for U256 {
 mod tests {
     use super::*;
 
-    impl<T: Into<u128>> From<T> for Target {
-        fn from(x: T) -> Self { Self(U256::from(x)) }
+    impl From<u64> for Target {
+        fn from(x: u64) -> Self { Self(U256::from(x)) }
+    }
+
+    impl From<u32> for Target {
+        fn from(x: u32) -> Self { Self(U256::from(x)) }
     }
 
     impl<T: Into<u128>> From<T> for Work {
@@ -967,7 +1105,7 @@ mod tests {
     }
 
     impl U256 {
-        /// Creates a U256 from a big-endian array of u64's
+        /// Constructs a new U256 from a big-endian array of u64's
         fn from_array(a: [u64; 4]) -> Self {
             let mut ret = U256::ZERO;
             ret.0 = (a[0] as u128) << 64 ^ (a[1] as u128);
@@ -1475,8 +1613,38 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serde")]
     #[test]
+    fn u256_to_from_hex_roundtrips() {
+        let val = U256(
+            0xDEAD_BEEA_A69B_455C_D41B_B662_A69B_4550,
+            0xA69B_455C_D41B_B662_A69B_4555_DEAD_BEEF,
+        );
+        let hex = format!("0x{:x}", val);
+        let got = U256::from_hex(&hex).expect("failed to parse hex");
+        assert_eq!(got, val);
+    }
+
+    #[test]
+    fn u256_to_from_unprefixed_hex_roundtrips() {
+        let val = U256(
+            0xDEAD_BEEA_A69B_455C_D41B_B662_A69B_4550,
+            0xA69B_455C_D41B_B662_A69B_4555_DEAD_BEEF,
+        );
+        let hex = format!("{:x}", val);
+        let got = U256::from_unprefixed_hex(&hex).expect("failed to parse hex");
+        assert_eq!(got, val);
+    }
+
+    #[test]
+    fn u256_from_hex_32_characters_long() {
+        let hex = "a69b455cd41bb662a69b4555deadbeef";
+        let want = U256(0x00, 0xA69B_455C_D41B_B662_A69B_4555_DEAD_BEEF);
+        let got = U256::from_unprefixed_hex(hex).expect("failed to parse hex");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
     fn u256_serde() {
         let check = |uint, hex| {
             let json = format!("\"{}\"", hex);
@@ -1522,7 +1690,7 @@ mod tests {
 
     #[test]
     fn u256_is_max_correct_negative() {
-        let tc = vec![U256::ZERO, U256::ONE, U256::from(u128::MAX)];
+        let tc = [U256::ZERO, U256::ONE, U256::from(u128::MAX)];
         for t in tc {
             assert!(!t.is_max())
         }
@@ -1539,25 +1707,25 @@ mod tests {
     #[test]
     fn compact_target_from_hex_lower() {
         let target = CompactTarget::from_hex("0x010034ab").unwrap();
-        assert_eq!(target, CompactTarget(0x010034ab));
+        assert_eq!(target, CompactTarget::from_consensus(0x010034ab));
     }
 
     #[test]
     fn compact_target_from_hex_upper() {
         let target = CompactTarget::from_hex("0X010034AB").unwrap();
-        assert_eq!(target, CompactTarget(0x010034ab));
+        assert_eq!(target, CompactTarget::from_consensus(0x010034ab));
     }
 
     #[test]
     fn compact_target_from_unprefixed_hex_lower() {
         let target = CompactTarget::from_unprefixed_hex("010034ab").unwrap();
-        assert_eq!(target, CompactTarget(0x010034ab));
+        assert_eq!(target, CompactTarget::from_consensus(0x010034ab));
     }
 
     #[test]
     fn compact_target_from_unprefixed_hex_upper() {
         let target = CompactTarget::from_unprefixed_hex("010034AB").unwrap();
-        assert_eq!(target, CompactTarget(0x010034ab));
+        assert_eq!(target, CompactTarget::from_consensus(0x010034ab));
     }
 
     #[test]
@@ -1569,14 +1737,125 @@ mod tests {
 
     #[test]
     fn compact_target_lower_hex_and_upper_hex() {
-        assert_eq!(format!("{:08x}", CompactTarget(0x01D0F456)), "01d0f456");
-        assert_eq!(format!("{:08X}", CompactTarget(0x01d0f456)), "01D0F456");
+        assert_eq!(format!("{:08x}", CompactTarget::from_consensus(0x01D0F456)), "01d0f456");
+        assert_eq!(format!("{:08X}", CompactTarget::from_consensus(0x01d0f456)), "01D0F456");
+    }
+
+    #[test]
+    fn compact_target_from_upwards_difficulty_adjustment() {
+        let params = Params::new(crate::Network::Signet);
+        let starting_bits = CompactTarget::from_consensus(503543726); // Genesis compact target on Signet
+        let start_time: u64 = 1598918400; // Genesis block unix time
+        let end_time: u64 = 1599332177; // Block 2015 unix time
+        let timespan = end_time - start_time; // Faster than expected
+        let adjustment = CompactTarget::from_next_work_required(starting_bits, timespan, &params);
+        let adjustment_bits = CompactTarget::from_consensus(503394215); // Block 2016 compact target
+        assert_eq!(adjustment, adjustment_bits);
+    }
+
+    #[test]
+    fn compact_target_from_downwards_difficulty_adjustment() {
+        let params = Params::new(crate::Network::Signet);
+        let starting_bits = CompactTarget::from_consensus(503394215); // Block 2016 compact target
+        let start_time: u64 = 1599332844; // Block 2016 unix time
+        let end_time: u64 = 1600591200; // Block 4031 unix time
+        let timespan = end_time - start_time; // Slower than expected
+        let adjustment = CompactTarget::from_next_work_required(starting_bits, timespan, &params);
+        let adjustment_bits = CompactTarget::from_consensus(503397348); // Block 4032 compact target
+        assert_eq!(adjustment, adjustment_bits);
+    }
+
+    #[test]
+    fn compact_target_from_upwards_difficulty_adjustment_using_headers() {
+        use crate::block::Version;
+        use crate::constants::genesis_block;
+        use crate::TxMerkleNode;
+        let params = Params::new(crate::Network::Signet);
+        let epoch_start = genesis_block(&params).header;
+
+        // Block 2015, the only information used are `bits` and `time`
+        let current = Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+            time: 1599332177,
+            bits: epoch_start.bits,
+            nonce: epoch_start.nonce,
+        };
+        let adjustment =
+            CompactTarget::from_header_difficulty_adjustment(epoch_start, current, params);
+        let adjustment_bits = CompactTarget::from_consensus(503394215); // Block 2016 compact target
+        assert_eq!(adjustment, adjustment_bits);
+    }
+
+    #[test]
+    fn compact_target_from_downwards_difficulty_adjustment_using_headers() {
+        use crate::block::Version;
+        use crate::TxMerkleNode;
+        let params = Params::new(crate::Network::Signet);
+        let starting_bits = CompactTarget::from_consensus(503394215); // Block 2016 compact target
+
+        // Block 2016, the only information used is `time`
+        let epoch_start = Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+            time: 1599332844,
+            bits: starting_bits,
+            nonce: 0,
+        };
+
+        // Block 4031, the only information used are `bits` and `time`
+        let current = Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+            time: 1600591200,
+            bits: starting_bits,
+            nonce: 0,
+        };
+        let adjustment =
+            CompactTarget::from_header_difficulty_adjustment(epoch_start, current, params);
+        let adjustment_bits = CompactTarget::from_consensus(503397348); // Block 4032 compact target
+        assert_eq!(adjustment, adjustment_bits);
+    }
+
+    #[test]
+    fn compact_target_from_maximum_upward_difficulty_adjustment() {
+        let params = Params::new(crate::Network::Signet);
+        let starting_bits = CompactTarget::from_consensus(503403001);
+        let timespan = (0.2 * params.pow_target_timespan as f64) as u64;
+        let got = CompactTarget::from_next_work_required(starting_bits, timespan, params);
+        let want =
+            Target::from_compact(starting_bits).min_transition_threshold().to_compact_lossy();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn compact_target_from_minimum_downward_difficulty_adjustment() {
+        let params = Params::new(crate::Network::Signet);
+        let starting_bits = CompactTarget::from_consensus(403403001); // High difficulty for Signet
+        let timespan = 5 * params.pow_target_timespan; // Really slow.
+        let got = CompactTarget::from_next_work_required(starting_bits, timespan, &params);
+        let want =
+            Target::from_compact(starting_bits).max_transition_threshold(params).to_compact_lossy();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn compact_target_from_adjustment_is_max_target() {
+        let params = Params::new(crate::Network::Signet);
+        let starting_bits = CompactTarget::from_consensus(503543726); // Genesis compact target on Signet
+        let timespan = 5 * params.pow_target_timespan; // Really slow.
+        let got = CompactTarget::from_next_work_required(starting_bits, timespan, &params);
+        let want = params.max_attainable_target.to_compact_lossy();
+        assert_eq!(got, want);
     }
 
     #[test]
     fn target_from_compact() {
         // (nBits, target)
-        let tests = vec![
+        let tests = [
             (0x0100_3456_u32, 0x00_u64), // High bit set.
             (0x0112_3456_u32, 0x12_u64),
             (0x0200_8000_u32, 0x80_u64),
@@ -1594,13 +1873,9 @@ mod tests {
 
     #[test]
     fn target_is_met_by_for_target_equals_hash() {
-        use std::str::FromStr;
-
-        use hashes::Hash;
-
-        let hash =
-            BlockHash::from_str("ef537f25c895bfa782526529a9b63d97aa631564d5d789c2b765448c8635fb6c")
-                .expect("failed to parse block hash");
+        let hash = "ef537f25c895bfa782526529a9b63d97aa631564d5d789c2b765448c8635fb6c"
+            .parse::<BlockHash>()
+            .expect("failed to parse block hash");
         let target = Target(U256::from_le_bytes(hash.to_byte_array()));
         assert!(target.is_met_by(hash));
     }
@@ -1616,17 +1891,22 @@ mod tests {
 
     #[test]
     fn target_difficulty_float() {
-        assert_eq!(Target::MAX.difficulty_float(), 1.0_f64);
+        let params = Params::new(crate::Network::Bitcoin);
+
+        assert_eq!(Target::MAX.difficulty_float(&params), 1.0_f64);
         assert_eq!(
-            Target::from_compact(CompactTarget::from_consensus(0x1c00ffff_u32)).difficulty_float(),
+            Target::from_compact(CompactTarget::from_consensus(0x1c00ffff_u32))
+                .difficulty_float(&params),
             256.0_f64
         );
         assert_eq!(
-            Target::from_compact(CompactTarget::from_consensus(0x1b00ffff_u32)).difficulty_float(),
+            Target::from_compact(CompactTarget::from_consensus(0x1b00ffff_u32))
+                .difficulty_float(&params),
             65536.0_f64
         );
         assert_eq!(
-            Target::from_compact(CompactTarget::from_consensus(0x1a00f3a2_u32)).difficulty_float(),
+            Target::from_compact(CompactTarget::from_consensus(0x1a00f3a2_u32))
+                .difficulty_float(&params),
             17628585.065897066_f64
         );
     }
@@ -1652,11 +1932,11 @@ mod tests {
         assert_eq!(back, target)
     }
 
-    #[cfg(feature = "std")]
     #[test]
+    #[cfg(feature = "std")]
     fn work_log2() {
         // Compare work log2 to historical Bitcoin Core values found in Core logs.
-        let tests: Vec<(u128, f64)> = vec![
+        let tests: &[(u128, f64)] = &[
             // (chainwork, core log2)                // height
             (0x200020002, 33.000022),                // 1
             (0xa97d67041c5e51596ee7, 79.405055),     // 308004
@@ -1665,7 +1945,7 @@ mod tests {
             (0x2ef447e01d1642c40a184ada, 93.553183), // 738965
         ];
 
-        for (chainwork, core_log2) in tests {
+        for &(chainwork, core_log2) in tests {
             // Core log2 in the logs is rounded to 6 decimal places.
             let log2 = (Work::from(chainwork).log2() * 1e6).round() / 1e6;
             assert_eq!(log2, core_log2)
@@ -1741,8 +2021,6 @@ mod tests {
 
     #[test]
     fn u256_to_f64() {
-        // Validate that the Target::MAX value matches the constant also used in difficulty calculation.
-        assert_eq!(Target::MAX.0.to_f64(), TARGET_MAX_F64);
         assert_eq!(U256::ZERO.to_f64(), 0.0_f64);
         assert_eq!(U256::ONE.to_f64(), 1.0_f64);
         assert_eq!(U256::MAX.to_f64(), 1.157920892373162e77_f64);

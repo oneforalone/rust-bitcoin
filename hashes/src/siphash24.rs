@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! SipHash 2-4 implementation.
-//!
 
-use core::ops::Index;
-use core::slice::SliceIndex;
-use core::{cmp, mem, ptr, str};
+use core::{cmp, mem};
 
-use crate::{FromSliceError, Hash as _, HashEngine as _};
+use crate::HashEngine as _;
 
-crate::internal_macros::hash_type! {
+crate::internal_macros::hash_type_no_default! {
     64,
     false,
     "Output of the SipHash24 hash function."
@@ -20,7 +17,7 @@ fn from_engine(e: HashEngine) -> Hash { Hash::from_u64(Hash::from_engine_to_u64(
 
 #[cfg(hashes_fuzz)]
 fn from_engine(e: HashEngine) -> Hash {
-    let state = e.midstate();
+    let state = e.state.clone();
     Hash::from_u64(state.v0 ^ state.v1 ^ state.v2 ^ state.v3)
 }
 
@@ -54,13 +51,11 @@ macro_rules! compress {
 macro_rules! load_int_le {
     ($buf:expr, $i:expr, $int_ty:ident) => {{
         debug_assert!($i + mem::size_of::<$int_ty>() <= $buf.len());
-        let mut data = 0 as $int_ty;
-        ptr::copy_nonoverlapping(
-            $buf.get_unchecked($i),
-            &mut data as *mut _ as *mut u8,
-            mem::size_of::<$int_ty>(),
-        );
-        data.to_le()
+        $int_ty::from_le_bytes(
+            $buf.get_unchecked($i..($i + mem::size_of::<$int_ty>()))
+                .try_into()
+                .expect("len is correctly computed using size_of"),
+        )
     }};
 }
 
@@ -82,20 +77,20 @@ pub struct State {
 pub struct HashEngine {
     k0: u64,
     k1: u64,
-    length: usize, // how many bytes we've processed
-    state: State,  // hash State
-    tail: u64,     // unprocessed bytes le
-    ntail: usize,  // how many bytes in tail are valid
+    bytes_hashed: u64, // how many bytes we've processed
+    state: State,      // hash State
+    tail: u64,         // unprocessed bytes le
+    ntail: usize,      // how many bytes in tail are valid
 }
 
 impl HashEngine {
-    /// Creates a new SipHash24 engine with keys.
+    /// Constructs a new SipHash24 engine with keys.
     #[inline]
     pub const fn with_keys(k0: u64, k1: u64) -> HashEngine {
         HashEngine {
             k0,
             k1,
-            length: 0,
+            bytes_hashed: 0,
             state: State {
                 v0: k0 ^ 0x736f6d6570736575,
                 v1: k1 ^ 0x646f72616e646f6d,
@@ -106,10 +101,6 @@ impl HashEngine {
             ntail: 0,
         }
     }
-
-    /// Creates a new SipHash24 engine.
-    #[inline]
-    pub const fn new() -> HashEngine { HashEngine::with_keys(0, 0) }
 
     /// Retrieves the keys of this engine.
     pub fn keys(&self) -> (u64, u64) { (self.k0, self.k1) }
@@ -129,29 +120,22 @@ impl HashEngine {
     }
 }
 
-impl Default for HashEngine {
-    fn default() -> Self { HashEngine::new() }
-}
-
 impl crate::HashEngine for HashEngine {
-    type MidState = State;
-
-    fn midstate(&self) -> State { self.state.clone() }
-
     const BLOCK_SIZE: usize = 8;
 
     #[inline]
     fn input(&mut self, msg: &[u8]) {
-        let length = msg.len();
-        self.length += length;
+        let bytes_hashed = msg.len();
+        self.bytes_hashed += bytes_hashed as u64; // Cast usize to u64 is ok.
 
         let mut needed = 0;
 
         if self.ntail != 0 {
             needed = 8 - self.ntail;
-            self.tail |= unsafe { u8to64_le(msg, 0, cmp::min(length, needed)) } << (8 * self.ntail);
-            if length < needed {
-                self.ntail += length;
+            self.tail |=
+                unsafe { u8to64_le(msg, 0, cmp::min(bytes_hashed, needed)) } << (8 * self.ntail);
+            if bytes_hashed < needed {
+                self.ntail += bytes_hashed;
                 return;
             } else {
                 self.state.v3 ^= self.tail;
@@ -162,7 +146,7 @@ impl crate::HashEngine for HashEngine {
         }
 
         // Buffered tail is now flushed, process new input.
-        let len = length - needed;
+        let len = bytes_hashed - needed;
         let left = len & 0x7;
 
         let mut i = needed;
@@ -180,10 +164,13 @@ impl crate::HashEngine for HashEngine {
         self.ntail = left;
     }
 
-    fn n_bytes_hashed(&self) -> usize { self.length }
+    fn n_bytes_hashed(&self) -> u64 { self.bytes_hashed }
 }
 
 impl Hash {
+    /// Produces a hash from the current state of a given engine.
+    pub fn from_engine(e: HashEngine) -> Hash { from_engine(e) }
+
     /// Hashes the given data with an engine with the provided keys.
     pub fn hash_with_keys(k0: u64, k1: u64, data: &[u8]) -> Hash {
         let mut engine = HashEngine::with_keys(k0, k1);
@@ -203,7 +190,7 @@ impl Hash {
     pub fn from_engine_to_u64(e: HashEngine) -> u64 {
         let mut state = e.state;
 
-        let b: u64 = ((e.length as u64 & 0xff) << 56) | e.tail;
+        let b: u64 = ((e.bytes_hashed & 0xff) << 56) | e.tail;
 
         state.v3 ^= b;
         HashEngine::c_rounds(&mut state);
@@ -216,9 +203,13 @@ impl Hash {
     }
 
     /// Returns the (little endian) 64-bit integer representation of the hash value.
-    pub fn as_u64(&self) -> u64 { u64::from_le_bytes(self.0) }
+    #[deprecated(since = "0.15.0", note = "use `to_u64` instead")]
+    pub fn as_u64(&self) -> u64 { self.to_u64() }
 
-    /// Creates a hash from its (little endian) 64-bit integer representation.
+    /// Returns the (little endian) 64-bit integer representation of the hash value.
+    pub fn to_u64(self) -> u64 { u64::from_le_bytes(self.0) }
+
+    /// Constructs a new hash from its (little endian) 64-bit integer representation.
     pub fn from_u64(hash: u64) -> Hash { Hash(hash.to_le_bytes()) }
 }
 
@@ -327,7 +318,7 @@ mod tests {
 
         for i in 0..64 {
             vin[i] = i as u8;
-            let vec = Hash::from_slice(&vecs[i][..]).unwrap();
+            let vec = Hash::from_slice(&vecs[i]).unwrap();
             let out = Hash::hash_with_keys(k0, k1, &vin[0..i]);
             assert_eq!(vec, out, "vec #{}", i);
 
@@ -346,7 +337,7 @@ mod benches {
 
     #[bench]
     pub fn siphash24_1ki(bh: &mut Bencher) {
-        let mut engine = siphash24::Hash::engine();
+        let mut engine = siphash24::HashEngine::with_keys(0, 0);
         let bytes = [1u8; 1024];
         bh.iter(|| {
             engine.input(&bytes);
@@ -356,7 +347,7 @@ mod benches {
 
     #[bench]
     pub fn siphash24_64ki(bh: &mut Bencher) {
-        let mut engine = siphash24::Hash::engine();
+        let mut engine = siphash24::HashEngine::with_keys(0, 0);
         let bytes = [1u8; 65536];
         bh.iter(|| {
             engine.input(&bytes);

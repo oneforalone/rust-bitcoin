@@ -1,6 +1,6 @@
 use bitcoin::address::Address;
-use bitcoin::blockdata::script;
 use bitcoin::consensus::encode;
+use bitcoin::script::{self, ScriptExt as _};
 use bitcoin::Network;
 use honggfuzz::fuzz;
 
@@ -23,8 +23,8 @@ fn do_test(data: &[u8]) {
                     // reserialized as numbers. (For -1 through 16, this will use special ops; for
                     // others it'll just reserialize them as pushes.)
                     if bytes.len() == 1 && bytes[0] != 0x80 && bytes[0] != 0x00 {
-                        if let Ok(num) = script::read_scriptint(bytes.as_bytes()) {
-                            b = b.push_int(num);
+                        if let Ok(num) = bytes.read_scriptint() {
+                            b = b.push_int_unchecked(num);
                         } else {
                             b = b.push_slice(bytes);
                         }

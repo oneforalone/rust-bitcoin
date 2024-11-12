@@ -9,13 +9,13 @@
 
 use core::fmt;
 
-use hashes::Hash as _;
 use internals::array_vec::ArrayVec;
 use secp256k1::{Secp256k1, Verification};
 
-use crate::blockdata::script::witness_version::WitnessVersion;
-use crate::blockdata::script::{PushBytes, Script};
+use super::witness_version::WitnessVersion;
+use super::{PushBytes, Script, WScriptHash, WitnessScriptSizeError};
 use crate::crypto::key::{CompressedPublicKey, TapTweak, TweakedPublicKey, UntweakedPublicKey};
+use crate::script::ScriptExt as _;
 use crate::taproot::TapNodeHash;
 
 /// The minimum byte size of a segregated witness program.
@@ -38,7 +38,7 @@ pub struct WitnessProgram {
 }
 
 impl WitnessProgram {
-    /// Creates a new witness program, copying the content from the given byte slice.
+    /// Constructs a new witness program, copying the content from the given byte slice.
     pub fn new(version: WitnessVersion, bytes: &[u8]) -> Result<Self, Error> {
         use Error::*;
 
@@ -56,34 +56,38 @@ impl WitnessProgram {
         Ok(WitnessProgram { version, program })
     }
 
-    /// Creates a [`WitnessProgram`] from a 20 byte pubkey hash.
+    /// Constructs a new [`WitnessProgram`] from a 20 byte pubkey hash.
     fn new_p2wpkh(program: [u8; 20]) -> Self {
         WitnessProgram { version: WitnessVersion::V0, program: ArrayVec::from_slice(&program) }
     }
 
-    /// Creates a [`WitnessProgram`] from a 32 byte script hash.
+    /// Constructs a new [`WitnessProgram`] from a 32 byte script hash.
     fn new_p2wsh(program: [u8; 32]) -> Self {
         WitnessProgram { version: WitnessVersion::V0, program: ArrayVec::from_slice(&program) }
     }
 
-    /// Creates a [`WitnessProgram`] from a 32 byte serialize taproot xonly pubkey.
+    /// Constructs a new [`WitnessProgram`] from a 32 byte serialize Taproot xonly pubkey.
     fn new_p2tr(program: [u8; 32]) -> Self {
         WitnessProgram { version: WitnessVersion::V1, program: ArrayVec::from_slice(&program) }
     }
 
-    /// Creates a [`WitnessProgram`] from `pk` for a P2WPKH output.
-    pub fn p2wpkh(pk: &CompressedPublicKey) -> Self {
+    /// Constructs a new [`WitnessProgram`] from `pk` for a P2WPKH output.
+    pub fn p2wpkh(pk: CompressedPublicKey) -> Self {
         let hash = pk.wpubkey_hash();
         WitnessProgram::new_p2wpkh(hash.to_byte_array())
     }
 
-    /// Creates a [`WitnessProgram`] from `script` for a P2WSH output.
-    pub fn p2wsh(script: &Script) -> Self {
-        let hash = script.wscript_hash();
+    /// Constructs a new [`WitnessProgram`] from `script` for a P2WSH output.
+    pub fn p2wsh(script: &Script) -> Result<Self, WitnessScriptSizeError> {
+        script.wscript_hash().map(Self::p2wsh_from_hash)
+    }
+
+    /// Constructs a new [`WitnessProgram`] from `script` for a P2WSH output.
+    pub fn p2wsh_from_hash(hash: WScriptHash) -> Self {
         WitnessProgram::new_p2wsh(hash.to_byte_array())
     }
 
-    /// Creates a pay to taproot address from an untweaked key.
+    /// Constructs a new pay to Taproot address from an untweaked key.
     pub fn p2tr<C: Verification>(
         secp: &Secp256k1<C>,
         internal_key: UntweakedPublicKey,
@@ -94,7 +98,7 @@ impl WitnessProgram {
         WitnessProgram::new_p2tr(pubkey)
     }
 
-    /// Creates a pay to taproot address from a pre-tweaked output key.
+    /// Constructs a new pay to Taproot address from a pre-tweaked output key.
     pub fn p2tr_tweaked(output_key: TweakedPublicKey) -> Self {
         let pubkey = output_key.to_inner().serialize();
         WitnessProgram::new_p2tr(pubkey)
@@ -158,5 +162,49 @@ impl std::error::Error for Error {
         match *self {
             InvalidLength(_) | InvalidSegwitV0Length(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn witness_program_is_too_short() {
+        let arbitrary_bytes = [0x00; MIN_SIZE - 1];
+        assert!(WitnessProgram::new(WitnessVersion::V15, &arbitrary_bytes).is_err()); // Arbitrary version
+    }
+
+    #[test]
+    fn witness_program_is_too_long() {
+        let arbitrary_bytes = [0x00; MAX_SIZE + 1];
+        assert!(WitnessProgram::new(WitnessVersion::V15, &arbitrary_bytes).is_err()); // Arbitrary version
+    }
+
+    #[test]
+    fn valid_v0_witness_programs() {
+        let arbitrary_bytes = [0x00; MAX_SIZE];
+
+        for size in MIN_SIZE..=MAX_SIZE {
+            let program = WitnessProgram::new(WitnessVersion::V0, &arbitrary_bytes[..size]);
+
+            if size == 20 {
+                assert!(program.expect("valid witness program").is_p2wpkh());
+                continue;
+            }
+            if size == 32 {
+                assert!(program.expect("valid witness program").is_p2wsh());
+                continue;
+            }
+            assert!(program.is_err());
+        }
+    }
+
+    #[test]
+    fn valid_v1_witness_programs() {
+        let arbitrary_bytes = [0x00; 32];
+        assert!(WitnessProgram::new(WitnessVersion::V1, &arbitrary_bytes)
+            .expect("valid witness program")
+            .is_p2tr());
     }
 }

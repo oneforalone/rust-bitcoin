@@ -9,13 +9,11 @@
 //! `std::io`'s traits without unnecessary complexity.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-
 // Experimental features we need.
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
-
 // Coding conventions.
 #![warn(missing_docs)]
-
+#![doc(test(attr(warn(unused))))]
 // Exclude lints we don't think are valuable.
 #![allow(clippy::needless_question_mark)] // https://github.com/rust-bitcoin/rust-bitcoin/pull/2134
 #![allow(clippy::manual_range_contains)] // More readable than clippy's format.
@@ -23,12 +21,17 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "std")]
+mod bridge;
 mod error;
 mod macros;
 
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
 use alloc::vec::Vec;
 use core::cmp;
+
+#[cfg(feature = "std")]
+pub use bridge::{FromStd, ToStd};
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 pub use self::error::{Error, ErrorKind};
@@ -55,7 +58,7 @@ pub trait Read {
         Ok(())
     }
 
-    /// Creates an adapter which will read at most `limit` bytes.
+    /// Constructs a new adapter which will read at most `limit` bytes.
     #[inline]
     fn take(&mut self, limit: u64) -> Take<Self> { Take { reader: self, remaining: limit } }
 
@@ -94,7 +97,7 @@ pub struct Take<'a, R: Read + ?Sized> {
     remaining: u64,
 }
 
-impl<'a, R: Read + ?Sized> Take<'a, R> {
+impl<R: Read + ?Sized> Take<'_, R> {
     /// Reads all bytes until EOF from the underlying reader into `buf`.
     #[cfg(feature = "alloc")]
     #[inline]
@@ -116,7 +119,7 @@ impl<'a, R: Read + ?Sized> Take<'a, R> {
     }
 }
 
-impl<'a, R: Read + ?Sized> Read for Take<'a, R> {
+impl<R: Read + ?Sized> Read for Take<'_, R> {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let len = cmp::min(buf.len(), self.remaining.try_into().unwrap_or(buf.len()));
@@ -127,7 +130,7 @@ impl<'a, R: Read + ?Sized> Read for Take<'a, R> {
 }
 
 // Impl copied from Rust stdlib.
-impl<'a, R: BufRead + ?Sized> BufRead for Take<'a, R> {
+impl<R: BufRead + ?Sized> BufRead for Take<'_, R> {
     #[inline]
     fn fill_buf(&mut self) -> Result<&[u8]> {
         // Don't call into inner reader at all at EOF because it may still block
@@ -150,6 +153,22 @@ impl<'a, R: BufRead + ?Sized> BufRead for Take<'a, R> {
     }
 }
 
+impl<T: Read> Read for &'_ mut T {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> { (**self).read(buf) }
+
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> { (**self).read_exact(buf) }
+}
+
+impl<T: BufRead> BufRead for &'_ mut T {
+    #[inline]
+    fn fill_buf(&mut self) -> Result<&[u8]> { (**self).fill_buf() }
+
+    #[inline]
+    fn consume(&mut self, amount: usize) { (**self).consume(amount) }
+}
+
 impl Read for &[u8] {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -158,12 +177,6 @@ impl Read for &[u8] {
         *self = &self[cnt..];
         Ok(cnt)
     }
-}
-
-#[cfg(feature = "std")]
-impl<R: std::io::Read> Read for std::io::BufReader<R> {
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> { Ok(std::io::Read::read(self, buf)?) }
 }
 
 impl BufRead for &[u8] {
@@ -175,15 +188,6 @@ impl BufRead for &[u8] {
     fn consume(&mut self, amount: usize) { *self = &self[amount..] }
 }
 
-#[cfg(feature = "std")]
-impl<R: std::io::Read> BufRead for std::io::BufReader<R> {
-    #[inline]
-    fn fill_buf(&mut self) -> Result<&[u8]> { Ok(std::io::BufRead::fill_buf(self)?) }
-
-    #[inline]
-    fn consume(&mut self, amount: usize) { std::io::BufRead::consume(self, amount) }
-}
-
 /// Wraps an in memory reader providing the `position` function.
 pub struct Cursor<T> {
     inner: T,
@@ -191,7 +195,7 @@ pub struct Cursor<T> {
 }
 
 impl<T: AsRef<[u8]>> Cursor<T> {
-    /// Creates a `Cursor` by wrapping `inner`.
+    /// Constructs a new `Cursor` by wrapping `inner`.
     #[inline]
     pub fn new(inner: T) -> Self { Cursor { inner, pos: 0 } }
 
@@ -199,11 +203,26 @@ impl<T: AsRef<[u8]>> Cursor<T> {
     #[inline]
     pub fn position(&self) -> u64 { self.pos }
 
+    /// Sets the internal position.
+    ///
+    /// This method allows seeking within the wrapped memory by setting the position.
+    ///
+    /// Note that setting a position that is larger than the buffer length will cause reads to
+    /// return no bytes (EOF).
+    #[inline]
+    pub fn set_position(&mut self, position: u64) { self.pos = position; }
+
     /// Returns the inner buffer.
     ///
     /// This is the whole wrapped buffer, including the bytes already read.
     #[inline]
     pub fn into_inner(self) -> T { self.inner }
+
+    /// Returns a reference to the inner buffer.
+    ///
+    /// This is the whole wrapped buffer, including the bytes already read.
+    #[inline]
+    pub fn inner(&self) -> &T { &self.inner }
 }
 
 impl<T: AsRef<[u8]>> Read for Cursor<T> {
@@ -213,8 +232,7 @@ impl<T: AsRef<[u8]>> Read for Cursor<T> {
         let start_pos = self.pos.try_into().unwrap_or(inner.len());
         let read = core::cmp::min(inner.len().saturating_sub(start_pos), buf.len());
         buf[..read].copy_from_slice(&inner[start_pos..start_pos + read]);
-        self.pos =
-            self.pos.saturating_add(read.try_into().unwrap_or(u64::max_value() /* unreachable */));
+        self.pos = self.pos.saturating_add(read.try_into().unwrap_or(u64::MAX /* unreachable */));
         Ok(read)
     }
 }
@@ -257,6 +275,17 @@ pub trait Write {
     }
 }
 
+impl<T: Write> Write for &'_ mut T {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> Result<usize> { (**self).write(buf) }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> { (**self).write_all(buf) }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> { (**self).flush() }
+}
+
 #[cfg(feature = "alloc")]
 impl Write for alloc::vec::Vec<u8> {
     #[inline]
@@ -269,7 +298,7 @@ impl Write for alloc::vec::Vec<u8> {
     fn flush(&mut self) -> Result<()> { Ok(()) }
 }
 
-impl<'a> Write for &'a mut [u8] {
+impl Write for &mut [u8] {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let cnt = core::cmp::min(self.len(), buf.len());
@@ -280,15 +309,6 @@ impl<'a> Write for &'a mut [u8] {
 
     #[inline]
     fn flush(&mut self) -> Result<()> { Ok(()) }
-}
-
-#[cfg(feature = "std")]
-impl<W: std::io::Write> Write for std::io::BufWriter<W> {
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> Result<usize> { Ok(std::io::Write::write(self, buf)?) }
-
-    #[inline]
-    fn flush(&mut self) -> Result<()> { Ok(std::io::Write::flush(self)?) }
 }
 
 /// A sink to which all writes succeed. See [`std::io::Sink`] for more info.
@@ -307,28 +327,30 @@ impl Write for Sink {
     fn flush(&mut self) -> Result<()> { Ok(()) }
 }
 
-#[cfg(feature = "std")]
-impl std::io::Write for Sink {
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
-
-    #[inline]
-    fn write_all(&mut self, _: &[u8]) -> std::io::Result<()> { Ok(()) }
-
-    #[inline]
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-}
-
 /// Returns a sink to which all writes succeed. See [`std::io::sink`] for more info.
 #[inline]
 pub fn sink() -> Sink { Sink }
 
+/// Wraps a `std` IO type to implement the traits from this crate.
+///
+/// All methods are passed through converting the errors.
+#[cfg(feature = "std")]
+#[inline]
+pub const fn from_std<T>(std_io: T) -> FromStd<T> { FromStd::new(std_io) }
+
+/// Wraps a mutable reference to `std` IO type to implement the traits from this crate.
+///
+/// All methods are passed through converting the errors.
+#[cfg(feature = "std")]
+#[inline]
+pub fn from_std_mut<T>(std_io: &mut T) -> &mut FromStd<T> { FromStd::new_mut(std_io) }
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(all(not(feature = "std"), feature = "alloc"))]
     use alloc::{string::ToString, vec};
+
+    use super::*;
 
     #[test]
     fn buf_read_fill_and_consume_slice() {
@@ -348,8 +370,7 @@ mod tests {
 
         // checks we can attempt to read from a now-empty reader.
         let fill = BufRead::fill_buf(&mut slice).unwrap();
-        assert_eq!(fill.len(), 0);
-        assert_eq!(fill, &[]);
+        assert!(fill.is_empty());
     }
 
     #[test]

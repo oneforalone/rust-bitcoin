@@ -2,22 +2,20 @@
 
 use core::fmt;
 
-use secp256k1::XOnlyPublicKey;
-
-use crate::blockdata::locktime::absolute;
-use crate::blockdata::opcodes::all::*;
-use crate::blockdata::opcodes::{self, Opcode};
-use crate::blockdata::script::{opcode_to_verify, write_scriptint, PushBytes, Script, ScriptBuf};
-use crate::blockdata::transaction::Sequence;
-use crate::key::PublicKey;
-use crate::prelude::*;
+use super::{opcode_to_verify, write_scriptint, Error, PushBytes, Script, ScriptBuf};
+use crate::locktime::absolute;
+use crate::opcodes::all::*;
+use crate::opcodes::Opcode;
+use crate::prelude::Vec;
+use crate::script::{ScriptBufExt as _, ScriptBufExtPriv as _, ScriptExtPriv as _};
+use crate::Sequence;
 
 /// An Object which can be used to construct a script piece by piece.
 #[derive(PartialEq, Eq, Clone)]
 pub struct Builder(ScriptBuf, Option<Opcode>);
 
 impl Builder {
-    /// Creates a new empty script.
+    /// Constructs a new empty script.
     #[inline]
     pub const fn new() -> Self { Builder(ScriptBuf::new(), None) }
 
@@ -31,19 +29,40 @@ impl Builder {
     ///
     /// Integers are encoded as little-endian signed-magnitude numbers, but there are dedicated
     /// opcodes to push some small integers.
-    pub fn push_int(self, data: i64) -> Builder {
-        // We can special-case -1, 1-16
-        if data == -1 || (1..=16).contains(&data) {
-            let opcode = Opcode::from((data - 1 + opcodes::OP_TRUE.to_u8() as i64) as u8);
-            self.push_opcode(opcode)
+    ///
+    /// # Errors
+    ///
+    /// Only errors if `data == i32::MIN` (CScriptNum cannot have value -2^31).
+    pub fn push_int(self, n: i32) -> Result<Builder, Error> {
+        if n == i32::MIN {
+            // ref: https://github.com/bitcoin/bitcoin/blob/cac846c2fbf6fc69bfc288fd387aa3f68d84d584/src/script/script.h#L230
+            Err(Error::NumericOverflow)
+        } else {
+            Ok(self.push_int_unchecked(n.into()))
         }
-        // We can also special-case zero
-        else if data == 0 {
-            self.push_opcode(opcodes::OP_0)
-        }
-        // Otherwise encode it as data
-        else {
-            self.push_int_non_minimal(data)
+    }
+
+    /// Adds instructions to push an unchecked integer onto the stack.
+    ///
+    /// Integers are encoded as little-endian signed-magnitude numbers, but there are dedicated
+    /// opcodes to push some small integers.
+    ///
+    /// This function implements `CScript::push_int64` from Core `script.h`.
+    ///
+    /// > Numeric opcodes (OP_1ADD, etc) are restricted to operating on 4-byte integers.
+    /// > The semantics are subtle, though: operands must be in the range [-2^31 +1...2^31 -1],
+    /// > but results may overflow (and are valid as long as they are not used in a subsequent
+    /// > numeric operation). CScriptNum enforces those semantics by storing results as
+    /// > an int64 and allowing out-of-range values to be returned as a vector of bytes but
+    /// > throwing an exception if arithmetic is done or the result is interpreted as an integer.
+    ///
+    /// Does not check whether `n` is in the range of [-2^31 +1...2^31 -1].
+    pub fn push_int_unchecked(self, n: i64) -> Builder {
+        match n {
+            -1 => self.push_opcode(OP_PUSHNUM_NEG1),
+            0 => self.push_opcode(OP_PUSHBYTES_0),
+            1..=16 => self.push_opcode(Opcode::from(n as u8 + (OP_PUSHNUM_1.to_u8() - 1))),
+            _ => self.push_int_non_minimal(n),
         }
     }
 
@@ -61,20 +80,6 @@ impl Builder {
         self.0.push_slice(data);
         self.1 = None;
         self
-    }
-
-    /// Adds instructions to push a public key onto the stack.
-    pub fn push_key(self, key: &PublicKey) -> Builder {
-        if key.compressed {
-            self.push_slice(key.inner.serialize())
-        } else {
-            self.push_slice(key.inner.serialize_uncompressed())
-        }
-    }
-
-    /// Adds instructions to push an XOnly public key onto the stack.
-    pub fn push_x_only_key(self, x_only_key: &XOnlyPublicKey) -> Builder {
-        self.push_slice(x_only_key.serialize())
     }
 
     /// Adds a single opcode to the script.
@@ -98,7 +103,7 @@ impl Builder {
         // "duplicated code" because we need to update `1` field
         match opcode_to_verify(self.1) {
             Some(opcode) => {
-                (self.0).0.pop();
+                (self.0).as_byte_vec().pop();
                 self.push_opcode(opcode)
             }
             None => self.push_opcode(OP_VERIFY),
@@ -107,12 +112,12 @@ impl Builder {
 
     /// Adds instructions to push an absolute lock time onto the stack.
     pub fn push_lock_time(self, lock_time: absolute::LockTime) -> Builder {
-        self.push_int(lock_time.to_consensus_u32().into())
+        self.push_int_unchecked(lock_time.to_consensus_u32().into())
     }
 
     /// Adds instructions to push a sequence number onto the stack.
     pub fn push_sequence(self, sequence: Sequence) -> Builder {
-        self.push_int(sequence.to_consensus_u32().into())
+        self.push_int_unchecked(sequence.to_consensus_u32().into())
     }
 
     /// Converts the `Builder` into `ScriptBuf`.
@@ -132,7 +137,7 @@ impl Default for Builder {
     fn default() -> Builder { Builder::new() }
 }
 
-/// Creates a new builder from an existing vector.
+/// Constructs a new builder from an existing vector.
 impl From<Vec<u8>> for Builder {
     fn from(v: Vec<u8>) -> Builder {
         let script = ScriptBuf::from(v);
@@ -142,7 +147,7 @@ impl From<Vec<u8>> for Builder {
 }
 
 impl fmt::Display for Builder {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { self.0.fmt_asm(f) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
 
 internals::debug_from_display!(Builder);

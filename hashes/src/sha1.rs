@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! SHA1 implementation.
-//!
 
-use core::ops::Index;
-use core::slice::SliceIndex;
-use core::{cmp, str};
+use core::cmp;
 
-use crate::{FromSliceError, HashEngine as _};
+use crate::{incomplete_block_len, HashEngine as _};
 
-crate::internal_macros::hash_type! {
+crate::internal_macros::general_hash_type! {
     160,
     false,
     "Output of the SHA1 hash function."
@@ -17,19 +14,19 @@ crate::internal_macros::hash_type! {
 
 fn from_engine(mut e: HashEngine) -> Hash {
     // pad buffer with a single 1-bit then all 0s, until there are exactly 8 bytes remaining
-    let data_len = e.length as u64;
+    let n_bytes_hashed = e.bytes_hashed;
 
     let zeroes = [0; BLOCK_SIZE - 8];
     e.input(&[0x80]);
-    if e.length % BLOCK_SIZE > zeroes.len() {
+    if incomplete_block_len(&e) > zeroes.len() {
         e.input(&zeroes);
     }
-    let pad_length = zeroes.len() - (e.length % BLOCK_SIZE);
+    let pad_length = zeroes.len() - incomplete_block_len(&e);
     e.input(&zeroes[..pad_length]);
-    debug_assert_eq!(e.length % BLOCK_SIZE, zeroes.len());
+    debug_assert_eq!(incomplete_block_len(&e), zeroes.len());
 
-    e.input(&(8 * data_len).to_be_bytes());
-    debug_assert_eq!(e.length % BLOCK_SIZE, 0);
+    e.input(&(8 * n_bytes_hashed).to_be_bytes());
+    debug_assert_eq!(incomplete_block_len(&e), 0);
 
     Hash(e.midstate())
 }
@@ -41,24 +38,21 @@ const BLOCK_SIZE: usize = 64;
 pub struct HashEngine {
     buffer: [u8; BLOCK_SIZE],
     h: [u32; 5],
-    length: usize,
+    bytes_hashed: u64,
 }
 
-impl Default for HashEngine {
-    fn default() -> Self {
-        HashEngine {
+impl HashEngine {
+    /// Constructs a new SHA1 hash engine.
+    pub const fn new() -> Self {
+        Self {
             h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0],
-            length: 0,
+            bytes_hashed: 0,
             buffer: [0; BLOCK_SIZE],
         }
     }
-}
-
-impl crate::HashEngine for HashEngine {
-    type MidState = [u8; 20];
 
     #[cfg(not(hashes_fuzz))]
-    fn midstate(&self) -> [u8; 20] {
+    pub(crate) fn midstate(&self) -> [u8; 20] {
         let mut ret = [0; 20];
         for (val, ret_bytes) in self.h.iter().zip(ret.chunks_exact_mut(4)) {
             ret_bytes.copy_from_slice(&val.to_be_bytes())
@@ -67,17 +61,23 @@ impl crate::HashEngine for HashEngine {
     }
 
     #[cfg(hashes_fuzz)]
-    fn midstate(&self) -> [u8; 20] {
+    pub(crate) fn midstate(&self) -> [u8; 20] {
         let mut ret = [0; 20];
         ret.copy_from_slice(&self.buffer[..20]);
         ret
     }
+}
 
+impl Default for HashEngine {
+    fn default() -> Self { Self::new() }
+}
+
+impl crate::HashEngine for HashEngine {
     const BLOCK_SIZE: usize = 64;
 
-    fn n_bytes_hashed(&self) -> usize { self.length }
+    fn n_bytes_hashed(&self) -> u64 { self.bytes_hashed }
 
-    engine_input_impl!();
+    crate::internal_macros::engine_input_impl!();
 }
 
 impl HashEngine {
@@ -130,21 +130,23 @@ mod tests {
     #[test]
     #[cfg(feature = "alloc")]
     fn test() {
-        use crate::{sha1, Hash, HashEngine};
+        use alloc::string::ToString;
+
+        use crate::{sha1, HashEngine};
 
         #[derive(Clone)]
         struct Test {
             input: &'static str,
-            output: Vec<u8>,
+            output: [u8; 20],
             output_str: &'static str,
         }
 
         #[rustfmt::skip]
-        let tests = vec![
+        let tests = [
             // Examples from wikipedia
             Test {
                 input: "",
-                output: vec![
+                output: [
                     0xda, 0x39, 0xa3, 0xee,
                     0x5e, 0x6b, 0x4b, 0x0d,
                     0x32, 0x55, 0xbf, 0xef,
@@ -155,7 +157,7 @@ mod tests {
             },
             Test {
                 input: "The quick brown fox jumps over the lazy dog",
-                output: vec![
+                output: [
                     0x2f, 0xd4, 0xe1, 0xc6,
                     0x7a, 0x2d, 0x28, 0xfc,
                     0xed, 0x84, 0x9e, 0xe1,
@@ -166,7 +168,7 @@ mod tests {
             },
             Test {
                 input: "The quick brown fox jumps over the lazy cog",
-                output: vec![
+                output: [
                     0xde, 0x9f, 0x2c, 0x7f,
                     0xd2, 0x5e, 0x1b, 0x3a,
                     0xfa, 0xd3, 0xe8, 0x5a,
@@ -181,8 +183,8 @@ mod tests {
             // Hash through high-level API, check hex encoding/decoding
             let hash = sha1::Hash::hash(test.input.as_bytes());
             assert_eq!(hash, test.output_str.parse::<sha1::Hash>().expect("parse hex"));
-            assert_eq!(&hash[..], &test.output[..]);
-            assert_eq!(&hash.to_string(), &test.output_str);
+            assert_eq!(hash.as_byte_array(), &test.output);
+            assert_eq!(hash.to_string(), test.output_str);
 
             // Hash through engine, checking that we can input byte by byte
             let mut engine = sha1::Hash::engine();
@@ -191,16 +193,16 @@ mod tests {
             }
             let manual_hash = sha1::Hash::from_engine(engine);
             assert_eq!(hash, manual_hash);
-            assert_eq!(hash.as_byte_array(), test.output.as_slice());
+            assert_eq!(hash.to_byte_array(), test.output);
         }
     }
 
-    #[cfg(feature = "serde")]
     #[test]
+    #[cfg(feature = "serde")]
     fn sha1_serde() {
         use serde_test::{assert_tokens, Configure, Token};
 
-        use crate::{sha1, Hash};
+        use crate::sha1;
 
         #[rustfmt::skip]
         static HASH_BYTES: [u8; 20] = [

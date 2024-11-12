@@ -52,41 +52,46 @@ pub fn fixed_time_eq(a: &[u8], b: &[u8]) -> bool {
     unsafe { (::core::ptr::read_volatile(&r) & 1) == 0 }
 }
 
-#[test]
-fn eq_test() {
-    assert!(fixed_time_eq(&[0b00000000], &[0b00000000]));
-    assert!(fixed_time_eq(&[0b00000001], &[0b00000001]));
-    assert!(fixed_time_eq(&[0b00000010], &[0b00000010]));
-    assert!(fixed_time_eq(&[0b00000100], &[0b00000100]));
-    assert!(fixed_time_eq(&[0b00001000], &[0b00001000]));
-    assert!(fixed_time_eq(&[0b00010000], &[0b00010000]));
-    assert!(fixed_time_eq(&[0b00100000], &[0b00100000]));
-    assert!(fixed_time_eq(&[0b01000000], &[0b01000000]));
-    assert!(fixed_time_eq(&[0b10000000], &[0b10000000]));
-    assert!(fixed_time_eq(&[0b11111111], &[0b11111111]));
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    assert!(!fixed_time_eq(&[0b00000001], &[0b00000000]));
-    assert!(!fixed_time_eq(&[0b00000001], &[0b11111111]));
-    assert!(!fixed_time_eq(&[0b00000010], &[0b00000000]));
-    assert!(!fixed_time_eq(&[0b00000010], &[0b11111111]));
-    assert!(!fixed_time_eq(&[0b00000100], &[0b00000000]));
-    assert!(!fixed_time_eq(&[0b00000100], &[0b11111111]));
-    assert!(!fixed_time_eq(&[0b00001000], &[0b00000000]));
-    assert!(!fixed_time_eq(&[0b00001000], &[0b11111111]));
-    assert!(!fixed_time_eq(&[0b00010000], &[0b00000000]));
-    assert!(!fixed_time_eq(&[0b00010000], &[0b11111111]));
-    assert!(!fixed_time_eq(&[0b00100000], &[0b00000000]));
-    assert!(!fixed_time_eq(&[0b00100000], &[0b11111111]));
-    assert!(!fixed_time_eq(&[0b01000000], &[0b00000000]));
-    assert!(!fixed_time_eq(&[0b01000000], &[0b11111111]));
-    assert!(!fixed_time_eq(&[0b10000000], &[0b00000000]));
-    assert!(!fixed_time_eq(&[0b10000000], &[0b11111111]));
+    #[test]
+    fn eq_test() {
+        assert!(fixed_time_eq(&[0b00000000], &[0b00000000]));
+        assert!(fixed_time_eq(&[0b00000001], &[0b00000001]));
+        assert!(fixed_time_eq(&[0b00000010], &[0b00000010]));
+        assert!(fixed_time_eq(&[0b00000100], &[0b00000100]));
+        assert!(fixed_time_eq(&[0b00001000], &[0b00001000]));
+        assert!(fixed_time_eq(&[0b00010000], &[0b00010000]));
+        assert!(fixed_time_eq(&[0b00100000], &[0b00100000]));
+        assert!(fixed_time_eq(&[0b01000000], &[0b01000000]));
+        assert!(fixed_time_eq(&[0b10000000], &[0b10000000]));
+        assert!(fixed_time_eq(&[0b11111111], &[0b11111111]));
 
-    assert!(fixed_time_eq(&[0b00000000, 0b00000000], &[0b00000000, 0b00000000]));
-    assert!(!fixed_time_eq(&[0b00000001, 0b00000000], &[0b00000000, 0b00000000]));
-    assert!(!fixed_time_eq(&[0b00000000, 0b00000001], &[0b00000000, 0b00000000]));
-    assert!(!fixed_time_eq(&[0b00000000, 0b00000000], &[0b00000001, 0b00000000]));
-    assert!(!fixed_time_eq(&[0b00000000, 0b00000000], &[0b00000001, 0b00000001]));
+        assert!(!fixed_time_eq(&[0b00000001], &[0b00000000]));
+        assert!(!fixed_time_eq(&[0b00000001], &[0b11111111]));
+        assert!(!fixed_time_eq(&[0b00000010], &[0b00000000]));
+        assert!(!fixed_time_eq(&[0b00000010], &[0b11111111]));
+        assert!(!fixed_time_eq(&[0b00000100], &[0b00000000]));
+        assert!(!fixed_time_eq(&[0b00000100], &[0b11111111]));
+        assert!(!fixed_time_eq(&[0b00001000], &[0b00000000]));
+        assert!(!fixed_time_eq(&[0b00001000], &[0b11111111]));
+        assert!(!fixed_time_eq(&[0b00010000], &[0b00000000]));
+        assert!(!fixed_time_eq(&[0b00010000], &[0b11111111]));
+        assert!(!fixed_time_eq(&[0b00100000], &[0b00000000]));
+        assert!(!fixed_time_eq(&[0b00100000], &[0b11111111]));
+        assert!(!fixed_time_eq(&[0b01000000], &[0b00000000]));
+        assert!(!fixed_time_eq(&[0b01000000], &[0b11111111]));
+        assert!(!fixed_time_eq(&[0b10000000], &[0b00000000]));
+        assert!(!fixed_time_eq(&[0b10000000], &[0b11111111]));
+
+        assert!(fixed_time_eq(&[0b00000000, 0b00000000], &[0b00000000, 0b00000000]));
+        assert!(!fixed_time_eq(&[0b00000001, 0b00000000], &[0b00000000, 0b00000000]));
+        assert!(!fixed_time_eq(&[0b00000000, 0b00000001], &[0b00000000, 0b00000000]));
+        assert!(!fixed_time_eq(&[0b00000000, 0b00000000], &[0b00000001, 0b00000000]));
+        assert!(!fixed_time_eq(&[0b00000000, 0b00000000], &[0b00000001, 0b00000001]));
+    }
 }
 
 #[cfg(bench)]
@@ -100,55 +105,55 @@ mod benches {
     fn bench_32b_constant_time_cmp_ne(bh: &mut Bencher) {
         let hash_a = sha256::Hash::hash(&[0; 1]);
         let hash_b = sha256::Hash::hash(&[1; 1]);
-        bh.iter(|| fixed_time_eq(&hash_a[..], &hash_b[..]))
+        bh.iter(|| fixed_time_eq(hash_a.as_byte_array(), hash_b.as_byte_array()))
     }
 
     #[bench]
     fn bench_32b_slice_cmp_ne(bh: &mut Bencher) {
         let hash_a = sha256::Hash::hash(&[0; 1]);
         let hash_b = sha256::Hash::hash(&[1; 1]);
-        bh.iter(|| &hash_a[..] == &hash_b[..])
+        bh.iter(|| hash_a.as_byte_array() == hash_b.as_byte_array())
     }
 
     #[bench]
     fn bench_32b_constant_time_cmp_eq(bh: &mut Bencher) {
         let hash_a = sha256::Hash::hash(&[0; 1]);
         let hash_b = sha256::Hash::hash(&[0; 1]);
-        bh.iter(|| fixed_time_eq(&hash_a[..], &hash_b[..]))
+        bh.iter(|| fixed_time_eq(hash_a.as_byte_array(), hash_b.as_byte_array()))
     }
 
     #[bench]
     fn bench_32b_slice_cmp_eq(bh: &mut Bencher) {
         let hash_a = sha256::Hash::hash(&[0; 1]);
         let hash_b = sha256::Hash::hash(&[0; 1]);
-        bh.iter(|| &hash_a[..] == &hash_b[..])
+        bh.iter(|| hash_a.as_byte_array() == hash_b.as_byte_array())
     }
 
     #[bench]
     fn bench_64b_constant_time_cmp_ne(bh: &mut Bencher) {
         let hash_a = sha512::Hash::hash(&[0; 1]);
         let hash_b = sha512::Hash::hash(&[1; 1]);
-        bh.iter(|| fixed_time_eq(&hash_a[..], &hash_b[..]))
+        bh.iter(|| fixed_time_eq(hash_a.as_byte_array(), hash_b.as_byte_array()))
     }
 
     #[bench]
     fn bench_64b_slice_cmp_ne(bh: &mut Bencher) {
         let hash_a = sha512::Hash::hash(&[0; 1]);
         let hash_b = sha512::Hash::hash(&[1; 1]);
-        bh.iter(|| &hash_a[..] == &hash_b[..])
+        bh.iter(|| hash_a.as_byte_array() == hash_b.as_byte_array())
     }
 
     #[bench]
     fn bench_64b_constant_time_cmp_eq(bh: &mut Bencher) {
         let hash_a = sha512::Hash::hash(&[0; 1]);
         let hash_b = sha512::Hash::hash(&[0; 1]);
-        bh.iter(|| fixed_time_eq(&hash_a[..], &hash_b[..]))
+        bh.iter(|| fixed_time_eq(hash_a.as_byte_array(), hash_b.as_byte_array()))
     }
 
     #[bench]
     fn bench_64b_slice_cmp_eq(bh: &mut Bencher) {
         let hash_a = sha512::Hash::hash(&[0; 1]);
         let hash_b = sha512::Hash::hash(&[0; 1]);
-        bh.iter(|| &hash_a[..] == &hash_b[..])
+        bh.iter(|| hash_a.as_byte_array() == hash_b.as_byte_array())
     }
 }

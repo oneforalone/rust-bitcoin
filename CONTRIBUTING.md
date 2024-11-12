@@ -110,13 +110,32 @@ Prerequisites that a PR must satisfy for merging into the `master` branch:
   commits, or, more preferably, as separate commits, so that it's easy to
   reorder them during review and check that the new tests fail without the new
   code);
-* contain all inline docs for newly introduced API and pass doc tests;
+* contain all inline docs for newly introduced API and pass doc tests including
+  running `just lint` without any errors or warnings;
 * be based on the recent `master` tip from the original repository at
   <https://github.com/rust-bitcoin/rust-bitcoin>.
 
 NB: reviewers may run more complex test/CI scripts, thus, satisfying all the
 requirements above is just a preliminary, but not necessary sufficient step for
 getting the PR accepted as a valid candidate PR for the `master` branch.
+
+High quality commits help us review and merge you contributions. We attempt to
+adhere to the ideas presented in the following two blog posts:
+
+- [How to Write a Git Commit Message](https://cbea.ms/git-commit/)
+- [Write Better Commits, Build Better Projects](https://github.blog/2022-06-30-write-better-commits-build-better-projects/)
+
+### Deprecation and Versioning
+
+Whenever any part of your code wants to mention the version number the code will
+be released in, primarily in deprecation notices, you should use the string
+`TBD` (verbatim), so that the release preparation script can detect the
+change and the correct version number can be filled in in preparation of the
+release.
+
+```rust
+    #[deprecated(since = "TBD", note = "use `alternative_method()` instead")]
+```
 
 ### Peer review
 
@@ -130,7 +149,7 @@ grammar fixes.
 
 Pull request merge requirements:
 - all CI test should pass,
-- at least two "accepts"/ACKs from the repository maintainers (see "refactor carve-out").
+- at least one "accepts"/ACKs from the repository maintainers
 - no reasonable "rejects"/NACKs from anybody who reviewed the code.
 
 Current list of the project maintainers:
@@ -144,32 +163,19 @@ Current list of the project maintainers:
 - [Riccardo Casatta](https://github.com/RCasatta)
 - [Tobin Harding](https://github.com/tcharding)
 
-#### Refactor carve-out
+#### Backporting
 
-The repository is going through heavy refactoring and "trivial" API redesign
-(eg, rename `Foo::empty` to `Foo::new`) as we push towards API stabilization. As
-such reviewers are either bored or overloaded with notifications, hence we have
-created a carve out to the 2-ACK rule.
+We maintain release branches (e.g. `0.32.x` for the `v0.32` releases).
 
-A PR may be considered for merge if it has a single ACK and has sat open for at
-least two weeks with no comments, questions, or NACKs.
+In order to backport changes to these branches the process we use is as follows:
 
-#### One ACK carve-out
+- PR change into `master`.
+- Mark the PR with the appropriate labels if backporting is needed (e.g. `port-0.32.x`).
+- Once PR merges create another PR that targets the appropriate branch.
+- If, and only if, the backport PR is identical to the original PR (i.e. created using
+  `git cherry-pick`) then the PR may be one-ACK merged.
 
-We reserve the right to merge PRs with a single ACK [0], at any time, if they match
-any of the following conditions:
-
-1. PR only touches CI i.e, only changes any of the `test.sh` scripts and/or
-   stuff in `.github/workflows`.
-2. Non-content changing documentation fixes i.e., grammar/typos, spelling, full
-   stops, capital letters. Any change with more substance must still get two
-   ACKs.
-3. Code moves that do not change the API e.g., moving error types to a private
-   submodule and re-exporting them from the original module. Must not include
-   any code changes except to import paths. This rule is more restrictive than
-   the refactor carve-out. It requires absolutely no change to the public API.
-
-[0] - Obviously author and ACK'er must not be the same person.
+Any other changes to the release branches should follow the normal 2-ACK merge policy.
 
 ## Coding conventions
 
@@ -179,9 +185,9 @@ Library reflects Bitcoin Core approach whenever possible.
 
 Naming of data structures/enums and their fields/variants must follow names used
 in Bitcoin Core, with the following exceptions:
-- the case should follow Rust standards (i.e. PascalCase for types and
-  snake_case for fields and variants);
-- omit `C`-prefixes.
+- The case should follow Rust standards (i.e. PascalCase for types and snake_case for fields and variants).
+- Omit `C`-prefixes.
+- If function `foo` needs a private helper function, use `foo_internal`.
 
 ### Upgrading dependencies
 
@@ -201,6 +207,14 @@ Use of `unsafe` code is prohibited unless there is a unanimous decision among
 library maintainers on the exclusion from this rule. In such cases there is a
 requirement to test unsafe code with sanitizers including Miri.
 
+### API changes
+
+All PRs that change the public API of `rust-bitcoin` will be checked on CI for
+semversioning compliance. This means that if the PR changes the public API in a
+way that is not backwards compatible, the PR will be flagged as a breaking change.
+Please check the [`semver-checks` workflow](.github/workflows/semver-checks.yml).
+Under the hood we use [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks).
+
 
 ### Policy
 
@@ -216,7 +230,6 @@ We use the following style for import statements, see
 (https://github.com/rust-bitcoin/rust-bitcoin/discussions/2088) for the discussion that led to this.
 
 ```rust
-
 // Modules first, as they are part of the project's structure.
 pub mod aa_this;
 mod bb_private;
@@ -232,6 +245,24 @@ pub use {
     crate::aa_aa_this,
     crate::bb_bb::That,
 }
+
+// Avoid wildcard imports, except for 3 rules:
+
+// Rule 1 - test modules.
+#[cfg(test)]
+mod tests {
+    use super::*; // OK
+}
+
+// Rule 2 - enum variants.
+use LockTime::*; // OK
+
+// Rule 3 - opcodes.
+use opcodes::all::*; // OK
+
+// Finally here is an example where we don't allow wildcard imports:
+use crate::prelude::*; // *NOT* OK
+use crate::prelude::{DisplayHex, String, Vec} // OK
 ```
 
 #### Return `Self`
@@ -289,9 +320,11 @@ More specifically an error should
 - have private fields unless we are very confident they won't change.
 - derive `Debug, Clone, PartialEq, Eq` (and `Copy` iff not `non_exhaustive`).
 - implement Display using `write_err!()` macro if a variant contains an inner error source.
-- have `Error` suffix
-- call `internals::impl_from_infallible!
+- have `Error` suffix on error types (structs and enums).
+- not have `Error` suffix on enum variants.
+- call `internals::impl_from_infallible!`.
 - implement `std::error::Error` if they are public (feature gated on "std").
+- have messages in lower case, except for proper nouns and variable names.
 
 ```rust
 /// Documentation for the `Error` type.
@@ -308,6 +341,52 @@ internals::impl_from_infallible!(Error);
 
 ```
 
+All errors that live in an `error` module (eg, `foo/error.rs`) and appear in a public function in
+`foo` module should be available from `foo` i.e., should be re-exported from `foo/mod.rs`.
+
+##### `expect` messages
+
+With respect to `expect` messages, they should follow the
+[Rust standard library guidelines](https://doc.rust-lang.org/std/option/enum.Option.html#recommended-message-style).
+More specifically, `expect` messages should be used to to describe the reason
+you expect the operation to succeed.
+For example, this `expect` message clearly states why the operation should succeed:
+
+```rust
+/// Serializes the public key to bytes.
+pub fn to_bytes(self) -> Vec<u8> {
+    let mut buf = Vec::new();
+    self.write_into(&mut buf).expect("vecs don't error");
+    buf
+}
+```
+
+Also note that `expect` messages, as with all error messages, should be lower
+case, except for proper nouns and variable names.
+
+<details>
+<summary>The details on why we chose this style</summary>
+
+According to the [Rust standard library](https://doc.rust-lang.org/std/error/index.html#common-message-styles),
+there are two common styles for how to write `expect` messages:
+
+- using the message to present information to users encountering a panic
+  ("expect as error message"); and
+- using the message to present information to developers debugging the panic
+  ("expect as precondition").
+
+We opted to use the "expect as precondition" since it clearly states why the
+operation should succeed.
+This may be better for communicating with developers, since they are the target
+audience for the error message and `rust-bitcoin`.
+
+If you want to know more about the decision error messages and expect messages,
+please check:
+
+- https://github.com/rust-bitcoin/rust-bitcoin/issues/2913
+- https://github.com/rust-bitcoin/rust-bitcoin/issues/3053
+- https://github.com/rust-bitcoin/rust-bitcoin/pull/3019
+</details>
 
 #### Rustdocs
 
@@ -362,6 +441,8 @@ Generally we prefer to have non-panicking APIs but it is impractical in some cas
 sure, feel free to ask. If we determine panicking is more practical it must be documented. Internal
 panics that could theoretically occur because of bugs in our code must not be documented.
 
+Example code within the rustdocs should compile and lint with `just lint` without any errors or
+warnings.
 
 #### Derives
 

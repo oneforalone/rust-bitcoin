@@ -7,13 +7,9 @@
 //! produces an entirely different hash compared to sha512. More information at
 //! <https://eprint.iacr.org/2010/548.pdf>.
 
-use core::ops::Index;
-use core::slice::SliceIndex;
-use core::str;
+use crate::sha512;
 
-use crate::{sha512, FromSliceError};
-
-crate::internal_macros::hash_type! {
+crate::internal_macros::general_hash_type! {
     256,
     false,
     "Output of the SHA512/256 hash function.\n\nSHA512/256 is a hash function that uses the sha512 algorithm but it truncates the output to 256 bits. It has different initial constants than sha512 so it produces an entirely different hash compared to sha512. More information at <https://eprint.iacr.org/2010/548.pdf>."
@@ -21,7 +17,7 @@ crate::internal_macros::hash_type! {
 
 fn from_engine(e: HashEngine) -> Hash {
     let mut ret = [0; 32];
-    ret.copy_from_slice(&sha512::from_engine(e.0)[..32]);
+    ret.copy_from_slice(&sha512::from_engine(e.0).as_byte_array()[..32]);
     Hash(ret)
 }
 
@@ -34,21 +30,19 @@ fn from_engine(e: HashEngine) -> Hash {
 #[derive(Clone)]
 pub struct HashEngine(sha512::HashEngine);
 
+impl HashEngine {
+    /// Constructs a new SHA512/256 hash engine.
+    pub const fn new() -> Self { Self(sha512::HashEngine::sha512_256()) }
+}
+
 impl Default for HashEngine {
-    #[rustfmt::skip]
-    fn default() -> Self {
-        HashEngine(sha512::HashEngine::sha512_256())
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl crate::HashEngine for HashEngine {
-    type MidState = [u8; 64];
-
-    fn midstate(&self) -> [u8; 64] { self.0.midstate() }
-
     const BLOCK_SIZE: usize = sha512::BLOCK_SIZE;
 
-    fn n_bytes_hashed(&self) -> usize { self.0.n_bytes_hashed() }
+    fn n_bytes_hashed(&self) -> u64 { self.0.n_bytes_hashed() }
 
     fn input(&mut self, inp: &[u8]) { self.0.input(inp); }
 }
@@ -58,21 +52,23 @@ mod tests {
     #[test]
     #[cfg(feature = "alloc")]
     fn test() {
-        use crate::{sha512_256, Hash, HashEngine};
+        use alloc::string::ToString;
+
+        use crate::{sha512_256, HashEngine};
 
         #[derive(Clone)]
         struct Test {
             input: &'static str,
-            output: Vec<u8>,
+            output: [u8; 32],
             output_str: &'static str,
         }
 
         #[rustfmt::skip]
-        let tests = vec![
+        let tests = [
             // Examples from go sha512/256 tests.
             Test {
                 input: "",
-                output: vec![
+                output: [
                     0xc6, 0x72, 0xb8, 0xd1, 0xef, 0x56, 0xed, 0x28,
                     0xab, 0x87, 0xc3, 0x62, 0x2c, 0x51, 0x14, 0x06,
                     0x9b, 0xdd, 0x3a, 0xd7, 0xb8, 0xf9, 0x73, 0x74,
@@ -82,7 +78,7 @@ mod tests {
             },
             Test {
                 input: "abcdef",
-                output: vec![
+                output: [
                     0xe4, 0xfd, 0xcb, 0x11, 0xd1, 0xac, 0x14, 0xe6,
                     0x98, 0x74, 0x3a, 0xcd, 0x88, 0x05, 0x17, 0x4c,
                     0xea, 0x5d, 0xdc, 0x0d, 0x31, 0x2e, 0x3e, 0x47,
@@ -92,7 +88,7 @@ mod tests {
             },
             Test {
                 input: "Discard medicine more than two years old.",
-                output: vec![
+                output: [
                     0x69, 0x0c, 0x8a, 0xd3, 0x91, 0x6c, 0xef, 0xd3,
                     0xad, 0x29, 0x22, 0x6d, 0x98, 0x75, 0x96, 0x5e,
                     0x3e, 0xe9, 0xec, 0x0d, 0x44, 0x82, 0xea, 0xcc,
@@ -102,7 +98,7 @@ mod tests {
             },
             Test {
                 input: "There is no reason for any individual to have a computer in their home. -Ken Olsen, 1977",
-                output: vec![
+                output: [
                     0xb5, 0xba, 0xf7, 0x47, 0xc3, 0x07, 0xf9, 0x88,
                     0x49, 0xec, 0x88, 0x1c, 0xf0, 0xd4, 0x86, 0x05,
                     0xae, 0x4e, 0xdd, 0x38, 0x63, 0x72, 0xae, 0xa9,
@@ -112,7 +108,7 @@ mod tests {
             },
             Test {
                 input: "The major problem is with sendmail.  -Mark Horton",
-                output: vec![
+                output: [
                     0x53, 0xed, 0x5f, 0x9b, 0x5c, 0x0b, 0x67, 0x4a,
                     0xc0, 0xf3, 0x42, 0x5d, 0x9f, 0x9a, 0x5d, 0x46,
                     0x26, 0x55, 0xb0, 0x7c, 0xc9, 0x0f, 0x5d, 0x0f,
@@ -126,8 +122,8 @@ mod tests {
             // Hash through high-level API, check hex encoding/decoding
             let hash = sha512_256::Hash::hash(test.input.as_bytes());
             assert_eq!(hash, test.output_str.parse::<sha512_256::Hash>().expect("parse hex"));
-            assert_eq!(&hash[..], &test.output[..]);
-            assert_eq!(&hash.to_string(), &test.output_str);
+            assert_eq!(hash.as_byte_array(), &test.output);
+            assert_eq!(hash.to_string(), test.output_str);
 
             // Hash through engine, checking that we can input byte by byte
             let mut engine = sha512_256::Hash::engine();
@@ -136,7 +132,7 @@ mod tests {
             }
             let manual_hash = sha512_256::Hash::from_engine(engine);
             assert_eq!(hash, manual_hash);
-            assert_eq!(hash.to_byte_array()[..].as_ref(), test.output.as_slice());
+            assert_eq!(hash.to_byte_array(), test.output);
         }
     }
 }

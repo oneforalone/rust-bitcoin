@@ -5,7 +5,6 @@
 //! Implementation of BIP174 Partially Signed Bitcoin Transaction Format as
 //! defined at <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki>
 //! except we define PSBTs containing non-standard sighash types as invalid.
-//!
 
 #[macro_use]
 mod macros;
@@ -18,17 +17,18 @@ use core::{cmp, fmt};
 #[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
 
-use hashes::Hash;
 use internals::write_err;
-use secp256k1::{Message, Secp256k1, Signing};
+use secp256k1::{Keypair, Message, Secp256k1, Signing, Verification};
 
-use crate::bip32::{self, KeySource, Xpriv, Xpub};
-use crate::blockdata::transaction::{self, Transaction, TxOut};
-use crate::crypto::ecdsa;
+use crate::bip32::{self, DerivationPath, KeySource, Xpriv, Xpub};
 use crate::crypto::key::{PrivateKey, PublicKey};
-use crate::prelude::*;
-use crate::sighash::{self, EcdsaSighashType, SighashCache};
-use crate::{Amount, FeeRate};
+use crate::crypto::{ecdsa, taproot};
+use crate::key::{TapTweak, XOnlyPublicKey};
+use crate::prelude::{btree_map, BTreeMap, BTreeSet, Borrow, Box, Vec};
+use crate::script::ScriptExt as _;
+use crate::sighash::{self, EcdsaSighashType, Prevouts, SighashCache};
+use crate::transaction::{self, Transaction, TransactionExt as _, TxOut};
+use crate::{Amount, FeeRate, TapLeafHash, TapSighashType};
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(inline)]
@@ -40,7 +40,6 @@ pub use self::{
 /// A Partially Signed Transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct Psbt {
     /// The unsigned transaction, scriptSigs and witnesses for each input must be empty.
     pub unsigned_tx: Transaction,
@@ -68,11 +67,11 @@ impl Psbt {
     /// For each PSBT input that contains UTXO information `Ok` is returned containing that information.
     /// The order of returned items is same as the order of inputs.
     ///
-    /// ## Errors
+    /// # Errors
     ///
     /// The function returns error when UTXO information is not present or is invalid.
     ///
-    /// ## Panics
+    /// # Panics
     ///
     /// The function panics if the length of transaction inputs is not equal to the length of PSBT inputs.
     pub fn iter_funding_utxos(&self) -> impl Iterator<Item = Result<&TxOut, Error>> {
@@ -104,7 +103,7 @@ impl Psbt {
         Ok(())
     }
 
-    /// Creates a PSBT from an unsigned transaction.
+    /// Constructs a new PSBT from an unsigned transaction.
     ///
     /// # Errors
     ///
@@ -141,7 +140,7 @@ impl Psbt {
 
     /// Extracts the [`Transaction`] from a [`Psbt`] by filling in the available signature information.
     ///
-    /// ## Errors
+    /// # Errors
     ///
     /// [`ExtractTxError`] variants will contain either the [`Psbt`] itself or the [`Transaction`]
     /// that was extracted. These can be extracted from the Errors in order to recover.
@@ -152,7 +151,7 @@ impl Psbt {
 
     /// Extracts the [`Transaction`] from a [`Psbt`] by filling in the available signature information.
     ///
-    /// ## Errors
+    /// # Errors
     ///
     /// See [`extract_tx`].
     ///
@@ -283,17 +282,12 @@ impl Psbt {
 
     /// Attempts to create _all_ the required signatures for this PSBT using `k`.
     ///
-    /// **NOTE**: Taproot inputs are, as yet, not supported by this function. We currently only
-    /// attempt to sign ECDSA inputs.
-    ///
-    /// If you just want to sign an input with one specific key consider using `sighash_ecdsa`. This
-    /// function does not support scripts that contain `OP_CODESEPARATOR`.
+    /// If you just want to sign an input with one specific key consider using `sighash_ecdsa` or
+    /// `sighash_taproot`. This function does not support scripts that contain `OP_CODESEPARATOR`.
     ///
     /// # Returns
     ///
-    /// Either Ok(SigningKeys) or Err((SigningKeys, SigningErrors)), where
-    /// - SigningKeys: A map of input index -> pubkey associated with secret key used to sign.
-    /// - SigningKeys: A map of input index -> the error encountered while attempting to sign.
+    /// A map of input index -> keys used to sign, for Taproot specifics please see [`SigningKeys`].
     ///
     /// If an error is returned some signatures may already have been added to the PSBT. Since
     /// `partial_sigs` is a [`BTreeMap`] it is safe to retry, previous sigs will be overwritten.
@@ -301,9 +295,9 @@ impl Psbt {
         &mut self,
         k: &K,
         secp: &Secp256k1<C>,
-    ) -> Result<SigningKeys, (SigningKeys, SigningErrors)>
+    ) -> Result<SigningKeysMap, (SigningKeysMap, SigningErrors)>
     where
-        C: Signing,
+        C: Signing + Verification,
         K: GetKey,
     {
         let tx = self.unsigned_tx.clone(); // clone because we need to mutably borrow when signing.
@@ -313,16 +307,30 @@ impl Psbt {
         let mut errors = BTreeMap::new();
 
         for i in 0..self.inputs.len() {
-            if let Ok(SigningAlgorithm::Ecdsa) = self.signing_algorithm(i) {
-                match self.bip32_sign_ecdsa(k, i, &mut cache, secp) {
-                    Ok(v) => {
-                        used.insert(i, v);
-                    }
-                    Err(e) => {
-                        errors.insert(i, e);
+            match self.signing_algorithm(i) {
+                Ok(SigningAlgorithm::Ecdsa) =>
+                    match self.bip32_sign_ecdsa(k, i, &mut cache, secp) {
+                        Ok(v) => {
+                            used.insert(i, SigningKeys::Ecdsa(v));
+                        }
+                        Err(e) => {
+                            errors.insert(i, e);
+                        }
+                    },
+                Ok(SigningAlgorithm::Schnorr) => {
+                    match self.bip32_sign_schnorr(k, i, &mut cache, secp) {
+                        Ok(v) => {
+                            used.insert(i, SigningKeys::Schnorr(v));
+                        }
+                        Err(e) => {
+                            errors.insert(i, e);
+                        }
                     }
                 }
-            };
+                Err(e) => {
+                    errors.insert(i, e);
+                }
+            }
         }
         if errors.is_empty() {
             Ok(used)
@@ -357,9 +365,9 @@ impl Psbt {
         let mut used = vec![]; // List of pubkeys used to sign the input.
 
         for (pk, key_source) in input.bip32_derivation.iter() {
-            let sk = if let Ok(Some(sk)) = k.get_key(KeyRequest::Bip32(key_source.clone()), secp) {
+            let sk = if let Ok(Some(sk)) = k.get_key(&KeyRequest::Bip32(key_source.clone()), secp) {
                 sk
-            } else if let Ok(Some(sk)) = k.get_key(KeyRequest::Pubkey(PublicKey::new(*pk)), secp) {
+            } else if let Ok(Some(sk)) = k.get_key(&KeyRequest::Pubkey(PublicKey::new(*pk)), secp) {
                 sk
             } else {
                 continue;
@@ -381,6 +389,102 @@ impl Psbt {
             input.partial_sigs.insert(pk, sig);
             used.push(pk);
         }
+
+        Ok(used)
+    }
+
+    /// Attempts to create all signatures required by this PSBT's `tap_key_origins` field, adding
+    /// them to `tap_key_sig` or `tap_script_sigs`.
+    ///
+    /// # Returns
+    ///
+    /// - Ok: A list of the xonly public keys used in signing. When signing a key path spend we
+    ///   return the internal key.
+    /// - Err: Error encountered trying to calculate the sighash AND we had the signing key.
+    fn bip32_sign_schnorr<C, K, T>(
+        &mut self,
+        k: &K,
+        input_index: usize,
+        cache: &mut SighashCache<T>,
+        secp: &Secp256k1<C>,
+    ) -> Result<Vec<XOnlyPublicKey>, SignError>
+    where
+        C: Signing + Verification,
+        T: Borrow<Transaction>,
+        K: GetKey,
+    {
+        let mut input = self.checked_input(input_index)?.clone();
+
+        let mut used = vec![]; // List of pubkeys used to sign the input.
+
+        for (&xonly, (leaf_hashes, key_source)) in input.tap_key_origins.iter() {
+            let sk = if let Ok(Some(secret_key)) =
+                k.get_key(&KeyRequest::Bip32(key_source.clone()), secp)
+            {
+                secret_key
+            } else {
+                continue;
+            };
+
+            // Considering the responsibility of the PSBT's finalizer to extract valid signatures,
+            // the goal of this algorithm is to provide signatures to the best of our ability:
+            // 1) If the conditions for key path spend are met, proceed to provide the signature for key path spend
+            // 2) If the conditions for script path spend are met, proceed to provide the signature for script path spend
+
+            // key path spend
+            if let Some(internal_key) = input.tap_internal_key {
+                // BIP 371: The internal key does not have leaf hashes, so can be indicated with a hashes len of 0.
+
+                // Based on input.tap_internal_key.is_some() alone, it is not sufficient to determine whether it is a key path spend.
+                // According to BIP 371, we also need to consider the condition leaf_hashes.is_empty() for a more accurate determination.
+                if internal_key == xonly && leaf_hashes.is_empty() && input.tap_key_sig.is_none() {
+                    let (msg, sighash_type) = self.sighash_taproot(input_index, cache, None)?;
+                    let key_pair = Keypair::from_secret_key(secp, &sk.inner)
+                        .tap_tweak(secp, input.tap_merkle_root)
+                        .to_inner();
+
+                    #[cfg(feature = "rand-std")]
+                    let signature = secp.sign_schnorr(&msg, &key_pair);
+                    #[cfg(not(feature = "rand-std"))]
+                    let signature = secp.sign_schnorr_no_aux_rand(&msg, &key_pair);
+
+                    let signature = taproot::Signature { signature, sighash_type };
+                    input.tap_key_sig = Some(signature);
+
+                    used.push(internal_key);
+                }
+            }
+
+            // script path spend
+            if let Some((leaf_hashes, _)) = input.tap_key_origins.get(&xonly) {
+                let leaf_hashes = leaf_hashes
+                    .iter()
+                    .filter(|lh| !input.tap_script_sigs.contains_key(&(xonly, **lh)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                if !leaf_hashes.is_empty() {
+                    let key_pair = Keypair::from_secret_key(secp, &sk.inner);
+
+                    for lh in leaf_hashes {
+                        let (msg, sighash_type) =
+                            self.sighash_taproot(input_index, cache, Some(lh))?;
+
+                        #[cfg(feature = "rand-std")]
+                        let signature = secp.sign_schnorr(&msg, &key_pair);
+                        #[cfg(not(feature = "rand-std"))]
+                        let signature = secp.sign_schnorr_no_aux_rand(&msg, &key_pair);
+
+                        let signature = taproot::Signature { signature, sighash_type };
+                        input.tap_script_sigs.insert((xonly, lh), signature);
+                    }
+
+                    used.push(sk.public_key(secp).into());
+                }
+            }
+        }
+
+        self.inputs[input_index] = input; // input_index is checked above.
 
         Ok(used)
     }
@@ -412,7 +516,7 @@ impl Psbt {
                 let sighash = cache
                     .legacy_signature_hash(input_index, spk, hash_ty.to_u32())
                     .expect("input checked above");
-                Ok((Message::from_digest(sighash.to_byte_array()), hash_ty))
+                Ok((Message::from(sighash), hash_ty))
             }
             Sh => {
                 let script_code =
@@ -420,29 +524,90 @@ impl Psbt {
                 let sighash = cache
                     .legacy_signature_hash(input_index, script_code, hash_ty.to_u32())
                     .expect("input checked above");
-                Ok((Message::from_digest(sighash.to_byte_array()), hash_ty))
+                Ok((Message::from(sighash), hash_ty))
             }
             Wpkh => {
                 let sighash = cache.p2wpkh_signature_hash(input_index, spk, utxo.value, hash_ty)?;
-                Ok((Message::from_digest(sighash.to_byte_array()), hash_ty))
+                Ok((Message::from(sighash), hash_ty))
             }
             ShWpkh => {
                 let redeem_script = input.redeem_script.as_ref().expect("checked above");
                 let sighash =
                     cache.p2wpkh_signature_hash(input_index, redeem_script, utxo.value, hash_ty)?;
-                Ok((Message::from_digest(sighash.to_byte_array()), hash_ty))
+                Ok((Message::from(sighash), hash_ty))
             }
             Wsh | ShWsh => {
                 let witness_script =
                     input.witness_script.as_ref().ok_or(SignError::MissingWitnessScript)?;
-                let sighash =
-                    cache.p2wsh_signature_hash(input_index, witness_script, utxo.value, hash_ty).map_err(SignError::SegwitV0Sighash)?;
-                Ok((Message::from_digest(sighash.to_byte_array()), hash_ty))
+                let sighash = cache
+                    .p2wsh_signature_hash(input_index, witness_script, utxo.value, hash_ty)
+                    .map_err(SignError::SegwitV0Sighash)?;
+                Ok((Message::from(sighash), hash_ty))
             }
             Tr => {
-                // This PSBT signing API is WIP, taproot to come shortly.
+                // This PSBT signing API is WIP, Taproot to come shortly.
                 Err(SignError::Unsupported)
             }
+        }
+    }
+
+    /// Returns the sighash message to sign an SCHNORR input along with the sighash type.
+    ///
+    /// Uses the [`TapSighashType`] from this input if one is specified. If no sighash type is
+    /// specified uses [`TapSighashType::Default`].
+    fn sighash_taproot<T: Borrow<Transaction>>(
+        &self,
+        input_index: usize,
+        cache: &mut SighashCache<T>,
+        leaf_hash: Option<TapLeafHash>,
+    ) -> Result<(Message, TapSighashType), SignError> {
+        use OutputType::*;
+
+        if self.signing_algorithm(input_index)? != SigningAlgorithm::Schnorr {
+            return Err(SignError::WrongSigningAlgorithm);
+        }
+
+        let input = self.checked_input(input_index)?;
+
+        match self.output_type(input_index)? {
+            Tr => {
+                let hash_ty = input
+                    .sighash_type
+                    .unwrap_or_else(|| TapSighashType::Default.into())
+                    .taproot_hash_ty()
+                    .map_err(|_| SignError::InvalidSighashType)?;
+
+                let spend_utxos =
+                    (0..self.inputs.len()).map(|i| self.spend_utxo(i).ok()).collect::<Vec<_>>();
+                let all_spend_utxos;
+
+                let is_anyone_can_pay = PsbtSighashType::from(hash_ty).to_u32() & 0x80 != 0;
+
+                let prev_outs = if is_anyone_can_pay {
+                    Prevouts::One(
+                        input_index,
+                        spend_utxos[input_index].ok_or(SignError::MissingSpendUtxo)?,
+                    )
+                } else if spend_utxos.iter().all(Option::is_some) {
+                    all_spend_utxos = spend_utxos.iter().filter_map(|x| *x).collect::<Vec<_>>();
+                    Prevouts::All(&all_spend_utxos)
+                } else {
+                    return Err(SignError::MissingSpendUtxo);
+                };
+
+                let sighash = if let Some(leaf_hash) = leaf_hash {
+                    cache.taproot_script_spend_signature_hash(
+                        input_index,
+                        &prev_outs,
+                        leaf_hash,
+                        hash_ty,
+                    )?
+                } else {
+                    cache.taproot_key_spend_signature_hash(input_index, &prev_outs, hash_ty)?
+                };
+                Ok((Message::from(sighash), hash_ty))
+            }
+            _ => Err(SignError::Unsupported),
         }
     }
 
@@ -538,7 +703,7 @@ impl Psbt {
     /// 'Fee' being the amount that will be paid for mining a transaction with the current inputs
     /// and outputs i.e., the difference in value of the total inputs and the total outputs.
     ///
-    /// ## Errors
+    /// # Errors
     ///
     /// - [`Error::MissingUtxo`] when UTXO information for any input is not present or is invalid.
     /// - [`Error::NegativeFee`] if calculated value is negative.
@@ -574,12 +739,13 @@ pub trait GetKey {
     /// Attempts to get the private key for `key_request`.
     ///
     /// # Returns
+    ///
     /// - `Some(key)` if the key is found.
     /// - `None` if the key was not found but no error was encountered.
     /// - `Err` if an error was encountered while looking for the key.
     fn get_key<C: Signing>(
         &self,
-        key_request: KeyRequest,
+        key_request: &KeyRequest,
         secp: &Secp256k1<C>,
     ) -> Result<Option<PrivateKey>, Self::Error>;
 }
@@ -589,15 +755,22 @@ impl GetKey for Xpriv {
 
     fn get_key<C: Signing>(
         &self,
-        key_request: KeyRequest,
+        key_request: &KeyRequest,
         secp: &Secp256k1<C>,
     ) -> Result<Option<PrivateKey>, Self::Error> {
         match key_request {
             KeyRequest::Pubkey(_) => Err(GetKeyError::NotSupported),
             KeyRequest::Bip32((fingerprint, path)) => {
-                let key = if self.fingerprint(secp) == fingerprint {
-                    let k = self.derive_priv(secp, &path)?;
-                    Some(k.to_priv())
+                let key = if self.fingerprint(secp) == *fingerprint {
+                    let k = self.derive_xpriv(secp, &path);
+                    Some(k.to_private_key())
+                } else if self.parent_fingerprint == *fingerprint
+                    && !path.is_empty()
+                    && path[0] == self.child_number
+                {
+                    let path = DerivationPath::from_iter(path.into_iter().skip(1).copied());
+                    let k = self.derive_xpriv(secp, &path);
+                    Some(k.to_private_key())
                 } else {
                     None
                 };
@@ -607,8 +780,20 @@ impl GetKey for Xpriv {
     }
 }
 
-/// Map of input index -> pubkey associated with secret key used to create signature for that input.
-pub type SigningKeys = BTreeMap<usize, Vec<PublicKey>>;
+/// Map of input index -> signing key for that input (see [`SigningKeys`]).
+pub type SigningKeysMap = BTreeMap<usize, SigningKeys>;
+
+/// A list of keys used to sign an input.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SigningKeys {
+    /// Keys used to sign an ECDSA input.
+    Ecdsa(Vec<PublicKey>),
+    /// Keys used to sign a Taproot input.
+    ///
+    /// - Key path spend: This is the internal key.
+    /// - Script path spend: This is the pubkey associated with the secret key that signed.
+    Schnorr(Vec<XOnlyPublicKey>),
+}
 
 /// Map of input index -> the error encountered while attempting to sign that input.
 pub type SigningErrors = BTreeMap<usize, SignError>;
@@ -622,23 +807,17 @@ impl GetKey for $set<Xpriv> {
 
     fn get_key<C: Signing>(
         &self,
-        key_request: KeyRequest,
+        key_request: &KeyRequest,
         secp: &Secp256k1<C>
     ) -> Result<Option<PrivateKey>, Self::Error> {
-        match key_request {
-            KeyRequest::Pubkey(_) => Err(GetKeyError::NotSupported),
-            KeyRequest::Bip32((fingerprint, path)) => {
-                for xpriv in self.iter() {
-                    if xpriv.parent_fingerprint == fingerprint {
-                        let k = xpriv.derive_priv(secp, &path)?;
-                        return Ok(Some(k.to_priv()));
-                    }
-                }
-                Ok(None)
-            }
-        }
+        // OK to stop at the first error because Xpriv::get_key() can only fail
+        // if this isn't a KeyRequest::Bip32, which would fail for all Xprivs.
+        self.iter()
+            .find_map(|xpriv| xpriv.get_key(key_request, secp).transpose())
+            .transpose()
     }
 }}}
+impl_get_key_for_set!(Vec);
 impl_get_key_for_set!(BTreeSet);
 #[cfg(feature = "std")]
 impl_get_key_for_set!(HashSet);
@@ -652,7 +831,7 @@ impl GetKey for $map<PublicKey, PrivateKey> {
 
     fn get_key<C: Signing>(
         &self,
-        key_request: KeyRequest,
+        key_request: &KeyRequest,
         _: &Secp256k1<C>,
     ) -> Result<Option<PrivateKey>, Self::Error> {
         match key_request {
@@ -721,7 +900,7 @@ pub enum OutputType {
     ShWsh,
     /// A pay-to-script-hash output excluding wrapped segwit (P2SH).
     Sh,
-    /// A taproot output (P2TR).
+    /// A Taproot output (P2TR).
     Tr,
 }
 
@@ -776,6 +955,8 @@ pub enum SignError {
     SegwitV0Sighash(transaction::InputsIndexError),
     /// Sighash computation error (p2wpkh input).
     P2wpkhSighash(sighash::P2wpkhError),
+    /// Sighash computation error (Taproot input).
+    TaprootError(sighash::TaprootError),
     /// Unable to determine the output type.
     UnknownOutputType,
     /// Unable to find key.
@@ -804,6 +985,7 @@ impl fmt::Display for SignError {
             NotWpkh => write!(f, "the scriptPubkey is not a P2WPKH script"),
             SegwitV0Sighash(ref e) => write_err!(f, "segwit v0 sighash"; e),
             P2wpkhSighash(ref e) => write_err!(f, "p2wpkh sighash"; e),
+            TaprootError(ref e) => write_err!(f, "Taproot sighash"; e),
             UnknownOutputType => write!(f, "unable to determine the output type"),
             KeyNotFound => write!(f, "unable to find key"),
             WrongSigningAlgorithm =>
@@ -821,6 +1003,7 @@ impl std::error::Error for SignError {
         match *self {
             SegwitV0Sighash(ref e) => Some(e),
             P2wpkhSighash(ref e) => Some(e),
+            TaprootError(ref e) => Some(e),
             IndexOutOfBounds(ref e) => Some(e),
             InvalidSighashType
             | MissingInputUtxo
@@ -844,6 +1027,10 @@ impl From<sighash::P2wpkhError> for SignError {
 
 impl From<IndexOutOfBoundsError> for SignError {
     fn from(e: IndexOutOfBoundsError) -> Self { SignError::IndexOutOfBounds(e) }
+}
+
+impl From<sighash::TaprootError> for SignError {
+    fn from(e: sighash::TaprootError) -> Self { SignError::TaprootError(e) }
 }
 
 /// This error is returned when extracting a [`Transaction`] from a [`Psbt`].
@@ -877,14 +1064,14 @@ impl fmt::Display for ExtractTxError {
 
         match *self {
             AbsurdFeeRate { fee_rate, .. } =>
-                write!(f, "An absurdly high fee rate of {}", fee_rate),
+                write!(f, "an absurdly high fee rate of {}", fee_rate),
             MissingInputValue { .. } => write!(
                 f,
-                "One of the inputs lacked value information (witness_utxo or non_witness_utxo)"
+                "one of the inputs lacked value information (witness_utxo or non_witness_utxo)"
             ),
             SendingTooMuch { .. } => write!(
                 f,
-                "Transaction would be invalid due to output value being greater than input value."
+                "transaction would be invalid due to output value being greater than input value."
             ),
         }
     }
@@ -955,7 +1142,7 @@ impl std::error::Error for IndexOutOfBoundsError {
 
 #[cfg(feature = "base64")]
 mod display_from_str {
-    use core::fmt::{self, Display, Formatter};
+    use core::fmt;
     use core::str::FromStr;
 
     use base64::display::Base64Display;
@@ -976,8 +1163,8 @@ mod display_from_str {
 
     internals::impl_from_infallible!(PsbtParseError);
 
-    impl Display for PsbtParseError {
-        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    impl fmt::Display for PsbtParseError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             use self::PsbtParseError::*;
 
             match *self {
@@ -999,8 +1186,8 @@ mod display_from_str {
         }
     }
 
-    impl Display for Psbt {
-        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    impl fmt::Display for Psbt {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "{}", Base64Display::new(&self.serialize(), &BASE64_STANDARD))
         }
     }
@@ -1025,13 +1212,15 @@ mod tests {
     use secp256k1::{All, SecretKey};
 
     use super::*;
+    use crate::address::script_pubkey::ScriptExt as _;
     use crate::bip32::ChildNumber;
-    use crate::blockdata::locktime::absolute;
-    use crate::blockdata::script::ScriptBuf;
-    use crate::blockdata::transaction::{self, OutPoint, Sequence, TxIn};
-    use crate::blockdata::witness::Witness;
+    use crate::locktime::absolute;
     use crate::network::NetworkKind;
     use crate::psbt::serialize::{Deserialize, Serialize};
+    use crate::script::{ScriptBuf, ScriptBufExt as _};
+    use crate::transaction::{self, OutPoint, TxIn};
+    use crate::witness::Witness;
+    use crate::Sequence;
 
     #[track_caller]
     pub fn hex_psbt(s: &str) -> Result<Psbt, crate::psbt::error::Error> {
@@ -1170,8 +1359,8 @@ mod tests {
         let fprint = sk.fingerprint(secp);
 
         let dpath: Vec<ChildNumber> = vec![
-            ChildNumber::from_normal_idx(0).unwrap(),
-            ChildNumber::from_normal_idx(1).unwrap(),
+            ChildNumber::ZERO_NORMAL,
+            ChildNumber::ONE_NORMAL,
             ChildNumber::from_normal_idx(2).unwrap(),
             ChildNumber::from_normal_idx(4).unwrap(),
             ChildNumber::from_normal_idx(42).unwrap(),
@@ -1180,9 +1369,9 @@ mod tests {
             ChildNumber::from_normal_idx(31337).unwrap(),
         ];
 
-        sk = sk.derive_priv(secp, &dpath).unwrap();
+        sk = sk.derive_xpriv(secp, &dpath);
 
-        let pk = Xpub::from_priv(secp, &sk);
+        let pk = Xpub::from_xpriv(secp, &sk);
 
         hd_keypaths.insert(pk.public_key, (fprint, dpath.into()));
 
@@ -1251,7 +1440,7 @@ mod tests {
     #[test]
     fn serialize_then_deserialize_psbtkvpair() {
         let expected = raw::Pair {
-            key: raw::Key { type_value: 0u8, key: vec![42u8, 69u8] },
+            key: raw::Key { type_value: 0u64, key_data: vec![42u8, 69u8] },
             value: vec![69u8, 42u8, 4u8],
         };
 
@@ -1302,7 +1491,7 @@ mod tests {
             }],
         };
         let unknown: BTreeMap<raw::Key, Vec<u8>> =
-            vec![(raw::Key { type_value: 1, key: vec![0, 1] }, vec![3, 4, 5])]
+            vec![(raw::Key { type_value: 1, key_data: vec![0, 1] }, vec![3, 4, 5])]
                 .into_iter()
                 .collect();
         let key_source = ("deadbeef".parse().unwrap(), "0'/1".parse().unwrap());
@@ -1381,9 +1570,6 @@ mod tests {
     }
 
     mod bip_vectors {
-        #[cfg(feature = "base64")]
-        use std::str::FromStr;
-
         use super::*;
         use crate::psbt::map::Map;
 
@@ -1397,7 +1583,7 @@ mod tests {
         #[test]
         #[should_panic(expected = "InvalidMagic")]
         fn invalid_vector_1_base64() {
-            Psbt::from_str("AgAAAAEmgXE3Ht/yhek3re6ks3t4AAwFZsuzrWRkFxPKQhcb9gAAAABqRzBEAiBwsiRRI+a/R01gxbUMBD1MaRpdJDXwmjSnZiqdwlF5CgIgATKcqdrPKAvfMHQOwDkEIkIsgctFg5RXrrdvwS7dlbMBIQJlfRGNM1e44PTCzUbbezn22cONmnCry5st5dyNv+TOMf7///8C09/1BQAAAAAZdqkU0MWZA8W6woaHYOkP1SGkZlqnZSCIrADh9QUAAAAAF6kUNUXm4zuDLEcFDyTT7rk8nAOUi8eHsy4TAA==").unwrap();
+            "AgAAAAEmgXE3Ht/yhek3re6ks3t4AAwFZsuzrWRkFxPKQhcb9gAAAABqRzBEAiBwsiRRI+a/R01gxbUMBD1MaRpdJDXwmjSnZiqdwlF5CgIgATKcqdrPKAvfMHQOwDkEIkIsgctFg5RXrrdvwS7dlbMBIQJlfRGNM1e44PTCzUbbezn22cONmnCry5st5dyNv+TOMf7///8C09/1BQAAAAAZdqkU0MWZA8W6woaHYOkP1SGkZlqnZSCIrADh9QUAAAAAF6kUNUXm4zuDLEcFDyTT7rk8nAOUi8eHsy4TAA==".parse::<Psbt>().unwrap();
         }
 
         #[test]
@@ -1411,7 +1597,7 @@ mod tests {
         #[test]
         #[should_panic(expected = "ConsensusEncoding")]
         fn invalid_vector_2_base64() {
-            Psbt::from_str("cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAA==")
+            "cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAA==".parse::<Psbt>()
                 .unwrap();
         }
 
@@ -1425,7 +1611,7 @@ mod tests {
         #[test]
         #[should_panic(expected = "UnsignedTxHasScriptSigs")]
         fn invalid_vector_3_base64() {
-            Psbt::from_str("cHNidP8BAP0KAQIAAAACqwlJoIxa98SbghL0F+LxWrP1wz3PFTghqBOfh3pbe+QAAAAAakcwRAIgR1lmF5fAGwNrJZKJSGhiGDR9iYZLcZ4ff89X0eURZYcCIFMJ6r9Wqk2Ikf/REf3xM286KdqGbX+EhtdVRs7tr5MZASEDXNxh/HupccC1AaZGoqg7ECy0OIEhfKaC3Ibi1z+ogpL+////qwlJoIxa98SbghL0F+LxWrP1wz3PFTghqBOfh3pbe+QBAAAAAP7///8CYDvqCwAAAAAZdqkUdopAu9dAy+gdmI5x3ipNXHE5ax2IrI4kAAAAAAAAGXapFG9GILVT+glechue4O/p+gOcykWXiKwAAAAAAAABASAA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHhwEEFgAUhdE1N/LiZUBaNNuvqePdoB+4IwgAAAA=").unwrap();
+            "cHNidP8BAP0KAQIAAAACqwlJoIxa98SbghL0F+LxWrP1wz3PFTghqBOfh3pbe+QAAAAAakcwRAIgR1lmF5fAGwNrJZKJSGhiGDR9iYZLcZ4ff89X0eURZYcCIFMJ6r9Wqk2Ikf/REf3xM286KdqGbX+EhtdVRs7tr5MZASEDXNxh/HupccC1AaZGoqg7ECy0OIEhfKaC3Ibi1z+ogpL+////qwlJoIxa98SbghL0F+LxWrP1wz3PFTghqBOfh3pbe+QBAAAAAP7///8CYDvqCwAAAAAZdqkUdopAu9dAy+gdmI5x3ipNXHE5ax2IrI4kAAAAAAAAGXapFG9GILVT+glechue4O/p+gOcykWXiKwAAAAAAAABASAA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHhwEEFgAUhdE1N/LiZUBaNNuvqePdoB+4IwgAAAA=".parse::<Psbt>().unwrap();
         }
 
         #[test]
@@ -1438,20 +1624,20 @@ mod tests {
         #[test]
         #[should_panic(expected = "MustHaveUnsignedTx")]
         fn invalid_vector_4_base64() {
-            Psbt::from_str("cHNidP8AAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAA==").unwrap();
+            "cHNidP8AAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAA==".parse::<Psbt>().unwrap();
         }
 
         #[test]
-        #[should_panic(expected = "DuplicateKey(Key { type_value: 0, key: [] })")]
+        #[should_panic(expected = "DuplicateKey(Key { type_value: 0, key_data: [] })")]
         fn invalid_vector_5() {
             hex_psbt("70736274ff0100750200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf60000000000feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e1300000100fda5010100000000010289a3c71eab4d20e0371bbba4cc698fa295c9463afa2e397f8533ccb62f9567e50100000017160014be18d152a9b012039daf3da7de4f53349eecb985ffffffff86f8aa43a71dff1448893a530a7237ef6b4608bbb2dd2d0171e63aec6a4890b40100000017160014fe3e9ef1a745e974d902c4355943abcb34bd5353ffffffff0200c2eb0b000000001976a91485cff1097fd9e008bb34af709c62197b38978a4888ac72fef84e2c00000017a914339725ba21efd62ac753a9bcd067d6c7a6a39d05870247304402202712be22e0270f394f568311dc7ca9a68970b8025fdd3b240229f07f8a5f3a240220018b38d7dcd314e734c9276bd6fb40f673325bc4baa144c800d2f2f02db2765c012103d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f210502483045022100d12b852d85dcd961d2f5f4ab660654df6eedcc794c0c33ce5cc309ffb5fce58d022067338a8e0e1725c197fb1a88af59f51e44e4255b20167c8684031c05d1f2592a01210223b72beef0965d10be0778efecd61fcac6f79a4ea169393380734464f84f2ab30000000001003f0200000001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000ffffffff010000000000000000036a010000000000000000").unwrap();
         }
 
         #[cfg(feature = "base64")]
         #[test]
-        #[should_panic(expected = "DuplicateKey(Key { type_value: 0, key: [] })")]
+        #[should_panic(expected = "DuplicateKey(Key { type_value: 0, key_data: [] })")]
         fn invalid_vector_5_base64() {
-            Psbt::from_str("cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAQA/AgAAAAH//////////////////////////////////////////wAAAAAA/////wEAAAAAAAAAAANqAQAAAAAAAAAA").unwrap();
+            "cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAQA/AgAAAAH//////////////////////////////////////////wAAAAAA/////wEAAAAAAAAAAANqAQAAAAAAAAAA".parse::<Psbt>().unwrap();
         }
 
         #[test]
@@ -1550,9 +1736,9 @@ mod tests {
             #[cfg(feature = "base64")]
             {
                 let base64str = "cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAAAA";
-                assert_eq!(Psbt::from_str(base64str).unwrap(), unserialized);
+                assert_eq!(base64str.parse::<Psbt>().unwrap(), unserialized);
                 assert_eq!(base64str, unserialized.to_string());
-                assert_eq!(Psbt::from_str(base64str).unwrap(), hex_psbt(base16str).unwrap());
+                assert_eq!(base64str.parse::<Psbt>().unwrap(), hex_psbt(base16str).unwrap());
             }
         }
 
@@ -1571,10 +1757,10 @@ mod tests {
 
             assert!(redeem_script.is_p2wpkh());
             assert_eq!(
-                redeem_script.to_p2sh(),
+                redeem_script.to_p2sh().unwrap(),
                 psbt.inputs[1].witness_utxo.as_ref().unwrap().script_pubkey
             );
-            assert_eq!(redeem_script.to_p2sh(), expected_out);
+            assert_eq!(redeem_script.to_p2sh().unwrap(), expected_out);
 
             for output in psbt.outputs {
                 assert_eq!(output.get_pairs().len(), 0)
@@ -1617,10 +1803,10 @@ mod tests {
 
             assert!(redeem_script.is_p2wpkh());
             assert_eq!(
-                redeem_script.to_p2sh(),
+                redeem_script.to_p2sh().unwrap(),
                 psbt.inputs[1].witness_utxo.as_ref().unwrap().script_pubkey
             );
-            assert_eq!(redeem_script.to_p2sh(), expected_out);
+            assert_eq!(redeem_script.to_p2sh().unwrap(), expected_out);
 
             for output in psbt.outputs {
                 assert!(!output.get_pairs().is_empty())
@@ -1642,11 +1828,11 @@ mod tests {
 
             assert!(redeem_script.is_p2wsh());
             assert_eq!(
-                redeem_script.to_p2sh(),
+                redeem_script.to_p2sh().unwrap(),
                 psbt.inputs[0].witness_utxo.as_ref().unwrap().script_pubkey
             );
 
-            assert_eq!(redeem_script.to_p2sh(), expected_out);
+            assert_eq!(redeem_script.to_p2sh().unwrap(), expected_out);
         }
 
         #[test]
@@ -1663,7 +1849,8 @@ mod tests {
             );
 
             let mut unknown: BTreeMap<raw::Key, Vec<u8>> = BTreeMap::new();
-            let key: raw::Key = raw::Key { type_value: 0x0fu8, key: hex!("010203040506070809") };
+            let key: raw::Key =
+                raw::Key { type_value: 0x0fu64, key_data: hex!("010203040506070809") };
             let value: Vec<u8> = hex!("0102030405060708090a0b0c0d0e0f");
 
             unknown.insert(key, value);
@@ -1681,11 +1868,11 @@ mod tests {
             assert_eq!(err.to_string(), "invalid xonly public key");
             let err = hex_psbt("70736274ff010071020000000127744ababf3027fe0d6cf23a96eee2efb188ef52301954585883e69b6624b2420000000000ffffffff02787c01000000000016001483a7e34bd99ff03a4962ef8a1a101bb295461ece606b042a010000001600147ac369df1b20e033d6116623957b0ac49f3c52e8000000000001012b00f2052a010000002251205a2c2cf5b52cf31f83ad2e8da63ff03183ecd8f609c7510ae8a48e03910a0757011342173bb3d36c074afb716fec6307a069a2e450b995f3c82785945ab8df0e24260dcd703b0cbf34de399184a9481ac2b3586db6601f026a77f7e4938481bc34751701aa000000").unwrap_err();
             #[cfg(feature = "std")]
-            assert_eq!(err.to_string(), "invalid taproot signature");
+            assert_eq!(err.to_string(), "invalid Taproot signature");
             #[cfg(not(feature = "std"))]
             assert_eq!(
                 err.to_string(),
-                "invalid taproot signature: invalid taproot signature size: 66"
+                "invalid Taproot signature: invalid Taproot signature size: 66"
             );
             let err = hex_psbt("70736274ff010071020000000127744ababf3027fe0d6cf23a96eee2efb188ef52301954585883e69b6624b2420000000000ffffffff02787c01000000000016001483a7e34bd99ff03a4962ef8a1a101bb295461ece606b042a010000001600147ac369df1b20e033d6116623957b0ac49f3c52e8000000000001012b00f2052a010000002251205a2c2cf5b52cf31f83ad2e8da63ff03183ecd8f609c7510ae8a48e03910a0757221602fe349064c98d6e2a853fa3c9b12bd8b304a19c195c60efa7ee2393046d3fa2321900772b2da75600008001000080000000800100000000000000000000").unwrap_err();
             assert_eq!(err.to_string(), "invalid xonly public key");
@@ -1699,23 +1886,23 @@ mod tests {
             #[cfg(not(feature = "std"))]
             assert_eq!(
                 err.to_string(),
-                "invalid hash when parsing slice: invalid slice length 33 (expected 32)"
+                "invalid hash when parsing slice: could not convert slice to array"
             );
             let err = hex_psbt("70736274ff01005e02000000019bd48765230bf9a72e662001f972556e54f0c6f97feb56bcb5600d817f6995260100000000ffffffff0148e6052a01000000225120030da4fce4f7db28c2cb2951631e003713856597fe963882cb500e68112cca63000000000001012b00f2052a01000000225120c2247efbfd92ac47f6f40b8d42d169175a19fa9fa10e4a25d7f35eb4dd85b69241142cb13ac68248de806aa6a3659cf3c03eb6821d09c8114a4e868febde865bb6d2cd970e15f53fc0c82f950fd560ffa919b76172be017368a89913af074f400b094289756aa3739ccc689ec0fcf3a360be32cc0b59b16e93a1e8bb4605726b2ca7a3ff706c4176649632b2cc68e1f912b8a578e3719ce7710885c7a966f49bcd43cb01010000").unwrap_err();
             #[cfg(feature = "std")]
-            assert_eq!(err.to_string(), "invalid taproot signature");
+            assert_eq!(err.to_string(), "invalid Taproot signature");
             #[cfg(not(feature = "std"))]
             assert_eq!(
                 err.to_string(),
-                "invalid taproot signature: invalid taproot signature size: 66"
+                "invalid Taproot signature: invalid Taproot signature size: 66"
             );
             let err = hex_psbt("70736274ff01005e02000000019bd48765230bf9a72e662001f972556e54f0c6f97feb56bcb5600d817f6995260100000000ffffffff0148e6052a01000000225120030da4fce4f7db28c2cb2951631e003713856597fe963882cb500e68112cca63000000000001012b00f2052a01000000225120c2247efbfd92ac47f6f40b8d42d169175a19fa9fa10e4a25d7f35eb4dd85b69241142cb13ac68248de806aa6a3659cf3c03eb6821d09c8114a4e868febde865bb6d2cd970e15f53fc0c82f950fd560ffa919b76172be017368a89913af074f400b093989756aa3739ccc689ec0fcf3a360be32cc0b59b16e93a1e8bb4605726b2ca7a3ff706c4176649632b2cc68e1f912b8a578e3719ce7710885c7a966f49bcd43cb0000").unwrap_err();
             #[cfg(feature = "std")]
-            assert_eq!(err.to_string(), "invalid taproot signature");
+            assert_eq!(err.to_string(), "invalid Taproot signature");
             #[cfg(not(feature = "std"))]
             assert_eq!(
                 err.to_string(),
-                "invalid taproot signature: invalid taproot signature size: 57"
+                "invalid Taproot signature: invalid Taproot signature size: 57"
             );
             let err = hex_psbt("70736274ff01005e02000000019bd48765230bf9a72e662001f972556e54f0c6f97feb56bcb5600d817f6995260100000000ffffffff0148e6052a01000000225120030da4fce4f7db28c2cb2951631e003713856597fe963882cb500e68112cca63000000000001012b00f2052a01000000225120c2247efbfd92ac47f6f40b8d42d169175a19fa9fa10e4a25d7f35eb4dd85b6926315c150929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac06f7d62059e9497a1a4a267569d9876da60101aff38e3529b9b939ce7f91ae970115f2e490af7cc45c4f78511f36057ce5c5a5c56325a29fb44dfc203f356e1f80023202cb13ac68248de806aa6a3659cf3c03eb6821d09c8114a4e868febde865bb6d2acc00000").unwrap_err();
             assert_eq!(err.to_string(), "invalid control block");
@@ -1893,7 +2080,7 @@ mod tests {
     fn serialize_and_deserialize_proprietary() {
         let mut psbt: Psbt = hex_psbt("70736274ff0100a00200000002ab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40000000000feffffffab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40100000000feffffff02603bea0b000000001976a914768a40bbd740cbe81d988e71de2a4d5c71396b1d88ac8e240000000000001976a9146f4620b553fa095e721b9ee0efe9fa039cca459788ac000000000001076a47304402204759661797c01b036b25928948686218347d89864b719e1f7fcf57d1e511658702205309eabf56aa4d8891ffd111fdf1336f3a29da866d7f8486d75546ceedaf93190121035cdc61fc7ba971c0b501a646a2a83b102cb43881217ca682dc86e2d73fa882920001012000e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787010416001485d13537f2e265405a34dbafa9e3dda01fb82308000000").unwrap();
         psbt.proprietary.insert(
-            raw::ProprietaryKey { prefix: b"test".to_vec(), subtype: 0u8, key: b"test".to_vec() },
+            raw::ProprietaryKey { prefix: b"test".to_vec(), subtype: 0u64, key: b"test".to_vec() },
             b"test".to_vec(),
         );
         assert!(!psbt.proprietary.is_empty());
@@ -1934,7 +2121,7 @@ mod tests {
 
         let sk = SecretKey::new(&mut thread_rng());
         let priv_key = PrivateKey::new(sk, NetworkKind::Test);
-        let pk = PublicKey::from_private_key(&secp, &priv_key);
+        let pk = PublicKey::from_private_key(&secp, priv_key);
 
         (priv_key, pk, secp)
     }
@@ -1947,7 +2134,7 @@ mod tests {
         let mut key_map = BTreeMap::new();
         key_map.insert(pk, priv_key);
 
-        let got = key_map.get_key(KeyRequest::Pubkey(pk), &secp).expect("failed to get key");
+        let got = key_map.get_key(&KeyRequest::Pubkey(pk), &secp).expect("failed to get key");
         assert_eq!(got.unwrap(), priv_key)
     }
 
@@ -1968,7 +2155,7 @@ mod tests {
                             vout: 0,
                         },
                         sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
-                        ..Default::default()
+                        ..TxIn::EMPTY_COINBASE
                     }
                 ],
                 output: vec![
@@ -1999,7 +2186,7 @@ mod tests {
                                     vout: 1,
                                 },
                                 sequence: Sequence::MAX,
-                                ..Default::default()
+                                ..TxIn::EMPTY_COINBASE
                             },
                             TxIn {
                                 previous_output: OutPoint {
@@ -2007,7 +2194,7 @@ mod tests {
                                     vout: 1,
                                 },
                                 sequence: Sequence::MAX,
-                                ..Default::default()
+                                ..TxIn::EMPTY_COINBASE
                             }
                         ],
                         output: vec![
@@ -2063,14 +2250,15 @@ mod tests {
     #[test]
     #[cfg(feature = "rand-std")]
     fn sign_psbt() {
+        use crate::address::script_pubkey::ScriptBufExt as _;
         use crate::bip32::{DerivationPath, Fingerprint};
         use crate::witness_version::WitnessVersion;
-        use crate::{WPubkeyHash, WitnessProgram};
+        use crate::WitnessProgram;
 
         let unsigned_tx = Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default(), TxIn::default()],
+            input: vec![TxIn::EMPTY_COINBASE, TxIn::EMPTY_COINBASE],
             output: vec![TxOut::NULL],
         };
         let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
@@ -2085,7 +2273,7 @@ mod tests {
         // First input we can spend. See comment above on key_map for why we use defaults here.
         let txout_wpkh = TxOut {
             value: Amount::from_sat(10),
-            script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::hash(&pk.to_bytes())),
+            script_pubkey: ScriptBuf::new_p2wpkh(pk.wpubkey_hash().unwrap()),
         };
         psbt.inputs[0].witness_utxo = Some(txout_wpkh);
 
@@ -2101,9 +2289,9 @@ mod tests {
         };
         psbt.inputs[1].witness_utxo = Some(txout_unknown_future);
 
-        let sigs = psbt.sign(&key_map, &secp).unwrap();
+        let (signing_keys, _) = psbt.sign(&key_map, &secp).unwrap_err();
 
-        assert!(sigs.len() == 1);
-        assert!(sigs[&0] == vec![pk]);
+        assert_eq!(signing_keys.len(), 1);
+        assert_eq!(signing_keys[&0], SigningKeys::Ecdsa(vec![pk]));
     }
 }

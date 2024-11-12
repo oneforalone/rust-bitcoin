@@ -6,10 +6,10 @@
 /// [`InputString`](super::InputString), the type of `source` is specified as the second argument
 /// to the macro.
 ///
-/// The resulting type is public, conditionally implements `std::error::Error` and has a private
+/// The resulting type is public, conditionally implements [`std::error::Error`] and has a private
 /// `new()` method for convenience.
 ///
-/// ## Parameters
+/// # Parameters
 ///
 /// * `name` - the name of the error type
 /// * `source` - the type of the source type
@@ -25,7 +25,7 @@ macro_rules! parse_error_type {
         }
 
         impl $name {
-            /// Creates `Self`.
+            /// Constructs a new `Self`.
             fn new<T: Into<$crate::error::InputString>>(input: T, source: $source) -> Self {
                 $name {
                     input: input.into(),

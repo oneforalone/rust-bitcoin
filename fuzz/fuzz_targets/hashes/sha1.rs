@@ -1,4 +1,4 @@
-use bitcoin::hashes::{sha1, Hash, HashEngine};
+use bitcoin::hashes::{sha1, HashEngine};
 use honggfuzz::fuzz;
 
 fn do_test(data: &[u8]) {
@@ -7,7 +7,7 @@ fn do_test(data: &[u8]) {
     let eng_hash = sha1::Hash::from_engine(engine);
 
     let hash = sha1::Hash::hash(data);
-    assert_eq!(&hash[..], &eng_hash[..]);
+    assert_eq!(hash.as_byte_array(), eng_hash.as_byte_array());
 }
 
 fn main() {

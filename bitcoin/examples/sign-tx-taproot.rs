@@ -2,13 +2,12 @@
 
 //! Demonstrate creating a transaction that spends to and from p2tr outputs.
 
-use std::str::FromStr;
-
-use bitcoin::hashes::Hash;
+use bitcoin::address::script_pubkey::ScriptBufExt as _;
 use bitcoin::key::{Keypair, TapTweak, TweakedKeypair, UntweakedPublicKey};
 use bitcoin::locktime::absolute;
 use bitcoin::secp256k1::{rand, Message, Secp256k1, SecretKey, Signing, Verification};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use bitcoin::witness::WitnessExt as _;
 use bitcoin::{
     transaction, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
     Txid, Witness,
@@ -36,7 +35,7 @@ fn main() {
     let input = TxIn {
         previous_output: dummy_out_point, // The dummy output we are spending.
         script_sig: ScriptBuf::default(), // For a p2tr script_sig is empty.
-        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+        sequence: Sequence::ENABLE_LOCKTIME_AND_RBF,
         witness: Witness::default(), // Filled in after signing.
     };
 
@@ -71,7 +70,7 @@ fn main() {
 
     // Sign the sighash using the secp256k1 library (exported by rust-bitcoin).
     let tweaked: TweakedKeypair = keypair.tap_tweak(&secp, None);
-    let msg = Message::from_digest(sighash.to_byte_array());
+    let msg = Message::from(sighash);
     let signature = secp.sign_schnorr(&msg, &tweaked.to_inner());
 
     // Update the witness stack.
@@ -99,13 +98,14 @@ fn senders_keys<C: Signing>(secp: &Secp256k1<C>) -> Keypair {
 ///
 /// (FWIW this is an arbitrary mainnet address from block 805222.)
 fn receivers_address() -> Address {
-    Address::from_str("bc1p0dq0tzg2r780hldthn5mrznmpxsxc0jux5f20fwj0z3wqxxk6fpqm7q0va")
+    "bc1p0dq0tzg2r780hldthn5mrznmpxsxc0jux5f20fwj0z3wqxxk6fpqm7q0va"
+        .parse::<Address<_>>()
         .expect("a valid address")
         .require_network(Network::Bitcoin)
         .expect("valid address for mainnet")
 }
 
-/// Creates a p2wpkh output locked to the key associated with `wpkh`.
+/// Constructs a new p2wpkh output locked to the key associated with `wpkh`.
 ///
 /// An utxo is described by the `OutPoint` (txid and index within the transaction that it was
 /// created). Using the out point one can get the transaction by `txid` and using the `vout` get the
@@ -120,7 +120,7 @@ fn dummy_unspent_transaction_output<C: Verification>(
     let script_pubkey = ScriptBuf::new_p2tr(secp, internal_key, None);
 
     let out_point = OutPoint {
-        txid: Txid::all_zeros(), // Obviously invalid.
+        txid: Txid::from_byte_array([0xFF; 32]), // Arbitrary invalid dummy value.
         vout: 0,
     };
 

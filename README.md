@@ -12,7 +12,7 @@
     <a href="https://github.com/rust-bitcoin/rust-bitcoin/blob/master/LICENSE"><img alt="CC0 1.0 Universal Licensed" src="https://img.shields.io/badge/license-CC0--1.0-blue.svg"/></a>
     <a href="https://github.com/rust-bitcoin/rust-bitcoin/actions?query=workflow%3AContinuous%20integration"><img alt="CI Status" src="https://github.com/rust-bitcoin/rust-bitcoin/workflows/Continuous%20integration/badge.svg"></a>
     <a href="https://docs.rs/bitcoin"><img alt="API Docs" src="https://img.shields.io/badge/docs.rs-bitcoin-green"/></a>
-    <a href="https://blog.rust-lang.org/2021/11/01/Rust-1.56.1.html"><img alt="Rustc Version 1.56.1+" src="https://img.shields.io/badge/rustc-1.56.1%2B-lightgrey.svg"/></a>
+    <a href="https://blog.rust-lang.org/2021/11/01/Rust-1.63.0.html"><img alt="Rustc Version 1.63.0+" src="https://img.shields.io/badge/rustc-1.63.0%2B-lightgrey.svg"/></a>
     <a href="https://gnusha.org/bitcoin-rust/"><img alt="Chat on IRC" src="https://img.shields.io/badge/irc-%23bitcoin--rust%20on%20libera.chat-blue"></a>
     <a href="https://github.com/model-checking/kani"><imp alt="kani" src="https://github.com/rust-bitcoin/rust-bitcoin/actions/workflows/kani.yaml/badge.svg"></a>
   </p>
@@ -52,6 +52,13 @@ are no plans to do so. Of course, patches to fix specific consensus incompatibil
 16-bit pointer sizes are not supported and we can't promise they will be. If you care about them
 please let us know, so we can know how large the interest is and possibly decide to support them.
 
+### Semver compliance
+
+We try hard to maintain strict semver compliance with our releases. This codebase includes some
+public functions marked unstable (e.g., `pub fn foo__unstable()`). These functions do not adhere to
+semver rules; use them at your own discretion.
+
+
 ## Documentation
 
 Currently can be found on [docs.rs/bitcoin](https://docs.rs/bitcoin/). Patches to add usage examples
@@ -65,14 +72,13 @@ questions or ideas you want to discuss please join us in
 [#bitcoin-rust](https://web.libera.chat/?channel=#bitcoin-rust) on
 [libera.chat](https://libera.chat).
 
-For more information please see `./CONTRIBUTING.md`.
+For more information please see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## Minimum Supported Rust Version (MSRV)
 
-This library should always compile with any combination of features on **Rust 1.56.1**.
+This library should compile with any combination of features on **Rust 1.63.0**.
 
-To build with the MSRV you will likely need to pin a bunch of dependencies, see `./contrib/test.sh`
-for the current list.
+Use `Cargo-minimal.lock` to build the MSRV by copying to `Cargo.lock` and building.
 
 ## External dependencies
 
@@ -186,14 +192,8 @@ fixing `act` issues.
 
 ### Githooks
 
-To assist devs in catching errors _before_ running CI we provide some githooks. If you do not
-already have locally configured githooks you can use the ones in this repository by running, in the
-root directory of the repository:
-```
-git config --local core.hooksPath githooks/
-```
-
-Alternatively add symlinks in your `.git/hooks` directory to any of the githooks we provide.
+To assist devs in catching errors _before_ running CI we provide some githooks. Copy the hooks in `githooks/`
+to your githooks folder or run `just githooks-install` to copy them all.
 
 ## Policy on Altcoins/Altchains
 
@@ -209,9 +209,14 @@ Our code is public domain so by all means fork it and go wild :)
 
 Release notes are done per crate, see:
 
-- [bitcoin CHANGELOG](bitcoin/CHANGELOG.md)
-- [hashes CHANGELOG](hashes/CHANGELOG.md)
-- [internals CHANGELOG](internals/CHANGELOG.md)
+- [`bitcoin` CHANGELOG](bitcoin/CHANGELOG.md)
+- [`addresses` CHANGELOG](addresses/CHANGELOG.md)
+- [`base58` CHANGELOG](base58/CHANGELOG.md)
+- [`hashes` CHANGELOG](hashes/CHANGELOG.md)
+- [`internals` CHANGELOG](internals/CHANGELOG.md)
+- [`io` CHANGELOG](io/CHANGELOG.md)
+- [`primitives` CHANGELOG](primitives/CHANGELOG.md)
+- [`units` CHANGELOG](units/CHANGELOG.md)
 
 
 ## Licensing

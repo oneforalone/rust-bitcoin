@@ -5,22 +5,21 @@
 use hashes::Hash;
 
 use super::{
-    TapNodeHash, TaprootBuilderError, TaprootError, TAPROOT_CONTROL_MAX_NODE_COUNT,
-    TAPROOT_CONTROL_NODE_SIZE,
+    InvalidMerkleBranchSizeError, InvalidMerkleTreeDepthError, TapNodeHash, TaprootError,
+    TAPROOT_CONTROL_MAX_NODE_COUNT, TAPROOT_CONTROL_NODE_SIZE,
 };
-use crate::prelude::*;
+use crate::prelude::{Borrow, BorrowMut, Box, Vec};
 
-/// The merkle proof for inclusion of a tree in a taptree hash.
+/// The Merkle proof for inclusion of a tree in a Taproot tree hash.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 #[cfg_attr(feature = "serde", serde(into = "Vec<TapNodeHash>"))]
 #[cfg_attr(feature = "serde", serde(try_from = "Vec<TapNodeHash>"))]
 pub struct TaprootMerkleBranch(Vec<TapNodeHash>);
 
 impl TaprootMerkleBranch {
     /// Returns a reference to the slice of hashes.
-    #[deprecated(since = "TBD", note = "Use `as_slice` instead")]
+    #[deprecated(since = "0.32.0", note = "use `as_slice` instead")]
     #[inline]
     pub fn as_inner(&self) -> &[TapNodeHash] { &self.0 }
 
@@ -28,11 +27,11 @@ impl TaprootMerkleBranch {
     #[inline]
     pub fn as_slice(&self) -> &[TapNodeHash] { &self.0 }
 
-    /// Returns the number of nodes in this merkle proof.
+    /// Returns the number of nodes in this Merkle proof.
     #[inline]
     pub fn len(&self) -> usize { self.0.len() }
 
-    /// Checks if this merkle proof is empty.
+    /// Checks if this Merkle proof is empty.
     #[inline]
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
 
@@ -47,15 +46,16 @@ impl TaprootMerkleBranch {
     /// if the number of hashes exceeds 128.
     pub fn decode(sl: &[u8]) -> Result<Self, TaprootError> {
         if sl.len() % TAPROOT_CONTROL_NODE_SIZE != 0 {
-            Err(TaprootError::InvalidMerkleBranchSize(sl.len()))
+            Err(InvalidMerkleBranchSizeError(sl.len()).into())
         } else if sl.len() > TAPROOT_CONTROL_NODE_SIZE * TAPROOT_CONTROL_MAX_NODE_COUNT {
-            Err(TaprootError::InvalidMerkleTreeDepth(sl.len() / TAPROOT_CONTROL_NODE_SIZE))
+            Err(InvalidMerkleTreeDepthError(sl.len() / TAPROOT_CONTROL_NODE_SIZE).into())
         } else {
             let inner = sl
                 .chunks_exact(TAPROOT_CONTROL_NODE_SIZE)
                 .map(|chunk| {
-                    TapNodeHash::from_slice(chunk)
-                        .expect("chunks_exact always returns the correct size")
+                    let bytes = <[u8; 32]>::try_from(chunk)
+                        .expect("chunks_exact always returns the correct size");
+                    TapNodeHash::from_byte_array(bytes)
                 })
                 .collect();
 
@@ -63,16 +63,17 @@ impl TaprootMerkleBranch {
         }
     }
 
-    /// Creates a merkle proof from list of hashes.
+    /// Constructs a new Merkle proof from list of hashes.
     ///
     /// # Errors
+    ///
     /// If inner proof length is more than [`TAPROOT_CONTROL_MAX_NODE_COUNT`] (128).
     #[inline]
     fn from_collection<T: AsRef<[TapNodeHash]> + Into<Vec<TapNodeHash>>>(
         collection: T,
-    ) -> Result<Self, TaprootError> {
+    ) -> Result<Self, InvalidMerkleTreeDepthError> {
         if collection.as_ref().len() > TAPROOT_CONTROL_MAX_NODE_COUNT {
-            Err(TaprootError::InvalidMerkleTreeDepth(collection.as_ref().len()))
+            Err(InvalidMerkleTreeDepthError(collection.as_ref().len()))
         } else {
             Ok(TaprootMerkleBranch(collection.into()))
         }
@@ -96,9 +97,9 @@ impl TaprootMerkleBranch {
     }
 
     /// Appends elements to proof.
-    pub(super) fn push(&mut self, h: TapNodeHash) -> Result<(), TaprootBuilderError> {
+    pub(super) fn push(&mut self, h: TapNodeHash) -> Result<(), InvalidMerkleTreeDepthError> {
         if self.len() >= TAPROOT_CONTROL_MAX_NODE_COUNT {
-            Err(TaprootBuilderError::InvalidMerkleTreeDepth(self.0.len()))
+            Err(InvalidMerkleTreeDepthError(self.0.len()))
         } else {
             self.0.push(h);
             Ok(())
@@ -106,7 +107,7 @@ impl TaprootMerkleBranch {
     }
 
     /// Returns the inner list of hashes.
-    #[deprecated(since = "TBD", note = "Use `into_vec` instead")]
+    #[deprecated(since = "0.32.0", note = "use `into_vec` instead")]
     #[inline]
     pub fn into_inner(self) -> Vec<TapNodeHash> { self.0 }
 
@@ -118,11 +119,12 @@ impl TaprootMerkleBranch {
 macro_rules! impl_try_from {
     ($from:ty) => {
         impl TryFrom<$from> for TaprootMerkleBranch {
-            type Error = TaprootError;
+            type Error = InvalidMerkleTreeDepthError;
 
-            /// Creates a merkle proof from list of hashes.
+            /// Constructs a new Merkle proof from list of hashes.
             ///
             /// # Errors
+            ///
             /// If inner proof length is more than [`TAPROOT_CONTROL_MAX_NODE_COUNT`] (128).
             #[inline]
             fn try_from(v: $from) -> Result<Self, Self::Error> {
@@ -221,7 +223,7 @@ impl BorrowMut<[TapNodeHash]> for TaprootMerkleBranch {
     fn borrow_mut(&mut self) -> &mut [TapNodeHash] { &mut self.0 }
 }
 
-/// Iterator over node hashes within Taproot merkle branch.
+/// Iterator over node hashes within Taproot Merkle branch.
 ///
 /// This is created by `into_iter` method on `TaprootMerkleBranch` (via `IntoIterator` trait).
 #[derive(Clone, Debug)]

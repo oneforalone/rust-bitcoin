@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! RIPEMD160 implementation.
-//!
 
-use core::ops::Index;
-use core::slice::SliceIndex;
-use core::{cmp, str};
+use core::cmp;
 
-use crate::{FromSliceError, HashEngine as _};
+use crate::{incomplete_block_len, HashEngine as _};
 
-crate::internal_macros::hash_type! {
+crate::internal_macros::general_hash_type! {
     160,
     false,
     "Output of the RIPEMD160 hash function."
@@ -18,19 +15,19 @@ crate::internal_macros::hash_type! {
 #[cfg(not(hashes_fuzz))]
 fn from_engine(mut e: HashEngine) -> Hash {
     // pad buffer with a single 1-bit then all 0s, until there are exactly 8 bytes remaining
-    let data_len = e.length as u64;
+    let n_bytes_hashed = e.bytes_hashed;
 
     let zeroes = [0; BLOCK_SIZE - 8];
     e.input(&[0x80]);
-    if e.length % BLOCK_SIZE > zeroes.len() {
+    if crate::incomplete_block_len(&e) > zeroes.len() {
         e.input(&zeroes);
     }
-    let pad_length = zeroes.len() - (e.length % BLOCK_SIZE);
+    let pad_length = zeroes.len() - incomplete_block_len(&e);
     e.input(&zeroes[..pad_length]);
-    debug_assert_eq!(e.length % BLOCK_SIZE, zeroes.len());
+    debug_assert_eq!(incomplete_block_len(&e), zeroes.len());
 
-    e.input(&(8 * data_len).to_le_bytes());
-    debug_assert_eq!(e.length % BLOCK_SIZE, 0);
+    e.input(&(8 * n_bytes_hashed).to_le_bytes());
+    debug_assert_eq!(incomplete_block_len(&e), 0);
 
     Hash(e.midstate())
 }
@@ -38,7 +35,7 @@ fn from_engine(mut e: HashEngine) -> Hash {
 #[cfg(hashes_fuzz)]
 fn from_engine(e: HashEngine) -> Hash {
     let mut res = e.midstate();
-    res[0] ^= (e.length & 0xff) as u8;
+    res[0] ^= (e.bytes_hashed & 0xff) as u8;
     Hash(res)
 }
 
@@ -49,21 +46,18 @@ const BLOCK_SIZE: usize = 64;
 pub struct HashEngine {
     buffer: [u8; BLOCK_SIZE],
     h: [u32; 5],
-    length: usize,
+    bytes_hashed: u64,
 }
 
-impl Default for HashEngine {
-    fn default() -> Self {
-        HashEngine {
+impl HashEngine {
+    /// Constructs a new SHA256 hash engine.
+    pub const fn new() -> Self {
+        Self {
             h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0],
-            length: 0,
+            bytes_hashed: 0,
             buffer: [0; BLOCK_SIZE],
         }
     }
-}
-
-impl crate::HashEngine for HashEngine {
-    type MidState = [u8; 20];
 
     #[cfg(not(hashes_fuzz))]
     fn midstate(&self) -> [u8; 20] {
@@ -80,12 +74,18 @@ impl crate::HashEngine for HashEngine {
         ret.copy_from_slice(&self.buffer[..20]);
         ret
     }
+}
 
+impl Default for HashEngine {
+    fn default() -> Self { Self::new() }
+}
+
+impl crate::HashEngine for HashEngine {
     const BLOCK_SIZE: usize = 64;
 
-    fn n_bytes_hashed(&self) -> usize { self.length }
+    fn n_bytes_hashed(&self) -> u64 { self.bytes_hashed }
 
-    engine_input_impl!();
+    crate::internal_macros::engine_input_impl!();
 }
 
 #[cfg(feature = "small-hash")]
@@ -411,23 +411,23 @@ mod tests {
     #[test]
     #[cfg(feature = "alloc")]
     fn test() {
-        use std::convert::TryFrom;
+        use alloc::string::ToString;
 
-        use crate::{ripemd160, Hash, HashEngine};
+        use crate::{ripemd160, HashEngine};
 
         #[derive(Clone)]
         struct Test {
             input: &'static str,
-            output: Vec<u8>,
+            output: [u8; 20],
             output_str: &'static str,
         }
 
         #[rustfmt::skip]
-        let tests = vec![
+        let tests = [
             // Test messages from FIPS 180-1
             Test {
                 input: "abc",
-                output: vec![
+                output: [
                     0x8e, 0xb2, 0x08, 0xf7,
                     0xe0, 0x5d, 0x98, 0x7a,
                     0x9b, 0x04, 0x4a, 0x8e,
@@ -439,7 +439,7 @@ mod tests {
             Test {
                 input:
                      "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
-                output: vec![
+                output: [
                     0x12, 0xa0, 0x53, 0x38,
                     0x4a, 0x9c, 0x0c, 0x88,
                     0xe4, 0x05, 0xa0, 0x6c,
@@ -451,7 +451,7 @@ mod tests {
             // Examples from wikipedia
             Test {
                 input: "The quick brown fox jumps over the lazy dog",
-                output: vec![
+                output: [
                     0x37, 0xf3, 0x32, 0xf6,
                     0x8d, 0xb7, 0x7b, 0xd9,
                     0xd7, 0xed, 0xd4, 0x96,
@@ -462,7 +462,7 @@ mod tests {
             },
             Test {
                 input: "The quick brown fox jumps over the lazy cog",
-                output: vec![
+                output: [
                     0x13, 0x20, 0x72, 0xdf,
                     0x69, 0x09, 0x33, 0x83,
                     0x5e, 0xb8, 0xb6, 0xad,
@@ -477,20 +477,10 @@ mod tests {
             // Hash through high-level API, check hex encoding/decoding
             let hash = ripemd160::Hash::hash(test.input.as_bytes());
             assert_eq!(hash, test.output_str.parse::<ripemd160::Hash>().expect("parse hex"));
-            assert_eq!(&hash[..], &test.output[..]);
-            assert_eq!(&hash.to_string(), &test.output_str);
-            assert_eq!(
-                ripemd160::Hash::from_bytes_ref(
-                    <&[u8; 20]>::try_from(&*test.output).expect("known length")
-                ),
-                &hash
-            );
-            assert_eq!(
-                ripemd160::Hash::from_bytes_mut(
-                    <&mut [u8; 20]>::try_from(&mut *test.output).expect("known length")
-                ),
-                &hash
-            );
+            assert_eq!(hash.as_byte_array(), &test.output);
+            assert_eq!(hash.to_string(), test.output_str);
+            assert_eq!(ripemd160::Hash::from_bytes_ref(&test.output), &hash);
+            assert_eq!(ripemd160::Hash::from_bytes_mut(&mut test.output), &hash);
 
             // Hash through engine, checking that we can input byte by byte
             let mut engine = ripemd160::Hash::engine();
@@ -499,16 +489,16 @@ mod tests {
             }
             let manual_hash = ripemd160::Hash::from_engine(engine);
             assert_eq!(hash, manual_hash);
-            assert_eq!(hash.as_byte_array(), test.output.as_slice());
+            assert_eq!(hash.to_byte_array(), test.output);
         }
     }
 
-    #[cfg(feature = "serde")]
     #[test]
+    #[cfg(feature = "serde")]
     fn ripemd_serde() {
         use serde_test::{assert_tokens, Configure, Token};
 
-        use crate::{ripemd160, Hash};
+        use crate::ripemd160;
 
         #[rustfmt::skip]
         static HASH_BYTES: [u8; 20] = [

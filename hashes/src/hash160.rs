@@ -6,30 +6,40 @@
 // contents here as CC0.
 
 //! HASH160 (SHA256 then RIPEMD160) implementation.
-//!
 
-use core::ops::Index;
-use core::slice::SliceIndex;
-use core::str;
+use crate::{ripemd160, sha256};
 
-use crate::{ripemd160, sha256, FromSliceError};
-
-crate::internal_macros::hash_type! {
+crate::internal_macros::general_hash_type! {
     160,
     false,
     "Output of the Bitcoin HASH160 hash function. (RIPEMD160(SHA256))"
 }
 
-type HashEngine = sha256::HashEngine;
+/// Engine to compute HASH160 hash function.
+#[derive(Clone)]
+pub struct HashEngine(sha256::HashEngine);
+
+impl HashEngine {
+    /// Constructs a new HASH160 hash engine.
+    pub const fn new() -> Self { Self(sha256::HashEngine::new()) }
+}
+
+impl Default for HashEngine {
+    fn default() -> Self { Self::new() }
+}
+
+impl crate::HashEngine for HashEngine {
+    const BLOCK_SIZE: usize = 64; // Same as sha256::HashEngine::BLOCK_SIZE;
+    fn input(&mut self, data: &[u8]) { self.0.input(data) }
+    fn n_bytes_hashed(&self) -> u64 { self.0.n_bytes_hashed() }
+}
 
 fn from_engine(e: HashEngine) -> Hash {
-    use crate::Hash as _;
-
-    let sha2 = sha256::Hash::from_engine(e);
-    let rmd = ripemd160::Hash::hash(&sha2[..]);
+    let sha2 = sha256::Hash::from_engine(e.0);
+    let rmd = ripemd160::Hash::hash(sha2.as_byte_array());
 
     let mut ret = [0; 20];
-    ret.copy_from_slice(&rmd[..]);
+    ret.copy_from_slice(rmd.as_byte_array());
     Hash(ret)
 }
 
@@ -38,21 +48,23 @@ mod tests {
     #[test]
     #[cfg(feature = "alloc")]
     fn test() {
-        use crate::{hash160, Hash, HashEngine};
+        use alloc::string::ToString;
+
+        use super::Hash;
+        use crate::{hash160, HashEngine};
 
         #[derive(Clone)]
-        #[cfg(feature = "alloc")]
         struct Test {
-            input: Vec<u8>,
-            output: Vec<u8>,
+            input: [u8; 65],
+            output: [u8; 20],
             output_str: &'static str,
         }
 
         #[rustfmt::skip]
-        let tests = vec![
+        let tests = [
             // Uncompressed pubkey obtained from Bitcoin key; data from validateaddress
             Test {
-                input: vec![
+                input: [
                     0x04, 0xa1, 0x49, 0xd7, 0x6c, 0x5d, 0xe2, 0x7a, 0x2d,
                     0xdb, 0xfa, 0xa1, 0x24, 0x6c, 0x4a, 0xdc, 0xd2, 0xb6,
                     0xf7, 0xaa, 0x29, 0x54, 0xc2, 0xe2, 0x53, 0x03, 0xf5,
@@ -62,7 +74,7 @@ mod tests {
                     0x81, 0x64, 0xcc, 0xf9, 0x82, 0xa1, 0x38, 0x69, 0x1a,
                     0x55, 0x19,
                 ],
-                output: vec![
+                output: [
                     0xda, 0x0b, 0x34, 0x52, 0xb0, 0x6f, 0xe3, 0x41,
                     0x62, 0x6a, 0xd0, 0x94, 0x9c, 0x18, 0x3f, 0xbd,
                     0xa5, 0x67, 0x68, 0x26,
@@ -75,8 +87,8 @@ mod tests {
             // Hash through high-level API, check hex encoding/decoding
             let hash = hash160::Hash::hash(&test.input[..]);
             assert_eq!(hash, test.output_str.parse::<hash160::Hash>().expect("parse hex"));
-            assert_eq!(&hash[..], &test.output[..]);
-            assert_eq!(&hash.to_string(), &test.output_str);
+            assert_eq!(hash.as_byte_array(), &test.output);
+            assert_eq!(hash.to_string(), test.output_str);
 
             // Hash through engine, checking that we can input byte by byte
             let mut engine = hash160::Hash::engine();
@@ -85,16 +97,16 @@ mod tests {
             }
             let manual_hash = Hash::from_engine(engine);
             assert_eq!(hash, manual_hash);
-            assert_eq!(hash.to_byte_array()[..].as_ref(), test.output.as_slice());
+            assert_eq!(hash.to_byte_array(), test.output);
         }
     }
 
-    #[cfg(feature = "serde")]
     #[test]
+    #[cfg(feature = "serde")]
     fn ripemd_serde() {
         use serde_test::{assert_tokens, Configure, Token};
 
-        use crate::{hash160, Hash};
+        use crate::hash160;
 
         #[rustfmt::skip]
         static HASH_BYTES: [u8; 20] = [
@@ -115,7 +127,7 @@ mod tests {
 mod benches {
     use test::Bencher;
 
-    use crate::{hash160, Hash, HashEngine};
+    use crate::{hash160, GeneralHash as _, Hash as _, HashEngine};
 
     #[bench]
     pub fn hash160_10(bh: &mut Bencher) {

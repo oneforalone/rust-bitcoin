@@ -1,3 +1,68 @@
+# 0.15.0 - 2024-10-16
+
+This release is massive. The biggest visable changes are to the `Hash` trait, which has mostly been replaced
+by inherent functions. You should not need to import it at all anymore for normal usage. Check out how we are
+using `hashes` in `rust-bitcoin` to see an example. Enjoy!
+
+* Remove the `util` and `serde_macros` modules and roll all code into new public `macros` module [#3299](https://github.com/rust-bitcoin/rust-bitcoin/pull/3299)
+* Remove `SliceIndex` implementation from hash types [#3296](https://github.com/rust-bitcoin/rust-bitcoin/pull/3296)
+* Rename `Midstate::into_parts` to `Midstate::to_parts` since it derives `Copy` [#3429](https://github.com/rust-bitcoin/rust-bitcoin/pull/3429)
+* Remove `schemars` support [#3395](https://github.com/rust-bitcoin/rust-bitcoin/pull/3395)
+* Deprecate `from_slice` methods in favor of arrays [#3301](https://github.com/rust-bitcoin/rust-bitcoin/pull/3301)
+* Rename `length` field to `bytes_hashed` [#3298](https://github.com/rust-bitcoin/rust-bitcoin/pull/3298)
+* Enforce that `Hash::Bytes` is an array [#3257](https://github.com/rust-bitcoin/rust-bitcoin/pull/3257)
+* `Siphash24` cleanup [#3222](https://github.com/rust-bitcoin/rust-bitcoin/pull/3222)
+* Reduce API surface of tagged wrapped hash types [#3184](https://github.com/rust-bitcoin/rust-bitcoin/pull/3184)
+* Rename `const_hash` functions to `hash_unoptimized` [#3129](https://github.com/rust-bitcoin/rust-bitcoin/pull/3129)
+* Remove `io` feature (use `bitcoin-io` dependency directly) [#3128](https://github.com/rust-bitcoin/rust-bitcoin/pull/3128)
+* Rename `Siphash::as_u64` to `Siphash::to_u64` [#3119](https://github.com/rust-bitcoin/rust-bitcoin/pull/3119)
+* Push up the `Default` bound on `HashEngine` in order to better support keyed hash functions [#3113](https://github.com/rust-bitcoin/rust-bitcoin/pull/3113)
+* Add a new `hash_reader` function [#3077](https://github.com/rust-bitcoin/rust-bitcoin/pull/3077)
+* Add `length` field to `sha256::Midstate` [#3010](https://github.com/rust-bitcoin/rust-bitcoin/pull/3010)
+* Remove midstate from the `GeneralHash` and `HashEngine` traits [#3009](https://github.com/rust-bitcoin/rust-bitcoin/pull/3009)
+* Add additional `HashEngine` types [#2988](https://github.com/rust-bitcoin/rust-bitcoin/pull/2988)
+* Remove `to`/`from`/`as_raw_hash` functions [#2981](https://github.com/rust-bitcoin/rust-bitcoin/pull/2981)
+* Split `Hash` trait into `GeneralHash` and `Hash` [#2910](https://github.com/rust-bitcoin/rust-bitcoin/pull/2910)
+* Remove `all_zeros` and constify constructors [#2877](https://github.com/rust-bitcoin/rust-bitcoin/pull/2877)
+* Add inherent functions to hashes (reduces need to import `Hash`) [#2852](https://github.com/rust-bitcoin/rust-bitcoin/pull/2852)
+* Add HKDF support [#2644](https://github.com/rust-bitcoin/rust-bitcoin/pull/2644)
+* Bump MSRV to Rust version 1.63.0 [#3100](https://github.com/rust-bitcoin/rust-bitcoin/pull/3100)
+* Change the default display direction of for tagged hashes to forwards [#2707](https://github.com/rust-bitcoin/rust-bitcoin/pull/2707)
+
+  Note please this usage if you need to display backward:
+
+```rust
+  sha256t_hash_newtype! {
+    /// Test detailed explanation.
+    struct NewTypeTag = hash_str("tag");
+
+    /// A test hash.
+    #[hash_newtype(backward)]
+    struct NewTypeHash(_);
+  }
+```
+
+# 0.14.0 - 2024-03-21
+
+* Bump MSRV to Rust version 1.56.1 [#2188](https://github.com/rust-bitcoin/rust-bitcoin/pull/2188)
+
+## API improvemnts
+
+* Add support for SHA384 [#2538](https://github.com/rust-bitcoin/rust-bitcoin/pull/2538)
+* Make from_hex inherent for byte-like types [#2491](https://github.com/rust-bitcoin/rust-bitcoin/pull/2491)
+* Add `Hash::from_bytes_iter` to construct hashes from iterators [#2272](https://github.com/rust-bitcoin/rust-bitcoin/pull/2272)
+* Make some constructors `const` [#2446](https://github.com/rust-bitcoin/rust-bitcoin/pull/2446)
+
+## Features/dependencies changes
+
+* Removed `core2` dependency in favour of the new `bitcoin-io` crate [#2066](https://github.com/rust-bitcoin/rust-bitcoin/pull/2066)
+* Remove "serde-std" [#2384](https://github.com/rust-bitcoin/rust-bitcoin/pull/2384)
+
+## Error handling improvements
+
+* Improve leaf errors [#2530](https://github.com/rust-bitcoin/rust-bitcoin/pull/2530)
+* Implement `From<Infallible>` for errors [#2516](https://github.com/rust-bitcoin/rust-bitcoin/pull/2516)
+
 # 0.13.0 - 2023-06-29
 
 The main improvement in this version is removal of the `hex` module in favour of the new

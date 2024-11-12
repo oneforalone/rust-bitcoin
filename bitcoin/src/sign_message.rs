@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Signature
+//! A signature.
 //!
 //! This module provides signature related functions including secp256k1 signature recovery when
 //! library is used with the `secp-recovery` feature.
-//!
 
-use hashes::{sha256d, Hash, HashEngine};
+use hashes::{sha256d, HashEngine};
+#[cfg(feature = "secp-recovery")]
+use secp256k1::SecretKey;
 
-use crate::consensus::{encode, Encodable};
+use crate::consensus::encode::WriteExt;
 
 #[rustfmt::skip]
 #[doc(inline)]
@@ -22,7 +23,7 @@ pub const BITCOIN_SIGNED_MSG_PREFIX: &[u8] = b"\x18Bitcoin Signed Message:\n";
 mod message_signing {
     use core::fmt;
 
-    use hashes::{sha256d, Hash};
+    use hashes::sha256d;
     use internals::write_err;
     use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 
@@ -91,7 +92,7 @@ mod message_signing {
     }
 
     impl MessageSignature {
-        /// Create a new [MessageSignature].
+        /// Constructs a new [MessageSignature].
         pub fn new(signature: RecoverableSignature, compressed: bool) -> MessageSignature {
             MessageSignature { signature, compressed }
         }
@@ -100,31 +101,30 @@ mod message_signing {
         pub fn serialize(&self) -> [u8; 65] {
             let (recid, raw) = self.signature.serialize_compact();
             let mut serialized = [0u8; 65];
-            serialized[0] = 27;
-            serialized[0] += recid.to_i32() as u8;
-            if self.compressed {
-                serialized[0] += 4;
-            }
+            serialized[0] = recid.to_i32() as u8 + if self.compressed { 31 } else { 27 };
             serialized[1..].copy_from_slice(&raw[..]);
             serialized
         }
 
-        /// Create from a byte slice.
-        pub fn from_slice(bytes: &[u8]) -> Result<MessageSignature, MessageSignatureError> {
-            if bytes.len() != 65 {
-                return Err(MessageSignatureError::InvalidLength);
-            }
+        /// Constructs a new `MessageSignature` from a fixed-length array.
+        pub fn from_byte_array(bytes: &[u8; 65]) -> Result<MessageSignature, secp256k1::Error> {
             // We just check this here so we can safely subtract further.
             if bytes[0] < 27 {
-                return Err(MessageSignatureError::InvalidEncoding(
-                    secp256k1::Error::InvalidRecoveryId,
-                ));
+                return Err(secp256k1::Error::InvalidRecoveryId);
             };
             let recid = RecoveryId::from_i32(((bytes[0] - 27) & 0x03) as i32)?;
             Ok(MessageSignature {
                 signature: RecoverableSignature::from_compact(&bytes[1..], recid)?,
                 compressed: ((bytes[0] - 27) & 0x04) != 0,
             })
+        }
+
+        /// Constructs a new `MessageSignature` from a byte slice.
+        #[deprecated(since = "TBD", note = "use `from_byte_array` instead")]
+        pub fn from_slice(bytes: &[u8]) -> Result<MessageSignature, MessageSignatureError> {
+            let byte_array: [u8; 65] =
+                bytes.try_into().map_err(|_| MessageSignatureError::InvalidLength)?;
+            Self::from_byte_array(&byte_array).map_err(MessageSignatureError::from)
         }
 
         /// Attempt to recover a public key from the signature and the signed message.
@@ -166,14 +166,19 @@ mod message_signing {
         use base64::prelude::{Engine as _, BASE64_STANDARD};
 
         use super::*;
-        use crate::prelude::*;
+        use crate::prelude::String;
 
         impl MessageSignature {
             /// Convert a signature from base64 encoding.
             pub fn from_base64(s: &str) -> Result<MessageSignature, MessageSignatureError> {
-                let bytes =
-                    BASE64_STANDARD.decode(s).map_err(|_| MessageSignatureError::InvalidBase64)?;
-                MessageSignature::from_slice(&bytes)
+                if s.len() != 88 {
+                    return Err(MessageSignatureError::InvalidLength);
+                }
+                let mut byte_array = [0; 65];
+                BASE64_STANDARD
+                    .decode_slice_unchecked(s, &mut byte_array)
+                    .map_err(|_| MessageSignatureError::InvalidBase64)?;
+                MessageSignature::from_byte_array(&byte_array).map_err(MessageSignatureError::from)
             }
 
             /// Convert to base64 encoding.
@@ -198,13 +203,26 @@ mod message_signing {
 }
 
 /// Hash message for signature using Bitcoin's message signing format.
-pub fn signed_msg_hash(msg: &str) -> sha256d::Hash {
+pub fn signed_msg_hash(msg: impl AsRef<[u8]>) -> sha256d::Hash {
+    let msg_bytes = msg.as_ref();
     let mut engine = sha256d::Hash::engine();
     engine.input(BITCOIN_SIGNED_MSG_PREFIX);
-    let msg_len = encode::VarInt::from(msg.len());
-    msg_len.consensus_encode(&mut engine).expect("engines don't error");
-    engine.input(msg.as_bytes());
+    engine.emit_compact_size(msg_bytes.len()).expect("engines don't error");
+    engine.input(msg_bytes);
     sha256d::Hash::from_engine(engine)
+}
+
+/// Sign message using Bitcoin's message signing format.
+#[cfg(feature = "secp-recovery")]
+pub fn sign<C: secp256k1::Signing>(
+    secp_ctx: &secp256k1::Secp256k1<C>,
+    msg: impl AsRef<[u8]>,
+    privkey: SecretKey,
+) -> MessageSignature {
+    let msg_hash = signed_msg_hash(msg);
+    let msg_to_sign = secp256k1::Message::from_digest(msg_hash.to_byte_array());
+    let secp_sig = secp_ctx.sign_ecdsa_recoverable(&msg_to_sign, &privkey);
+    MessageSignature { signature: secp_sig, compressed: true }
 }
 
 #[cfg(test)]
@@ -223,8 +241,6 @@ mod tests {
     #[test]
     #[cfg(all(feature = "secp-recovery", feature = "base64", feature = "rand-std"))]
     fn test_message_signature() {
-        use core::str::FromStr;
-
         use secp256k1;
 
         use crate::{Address, AddressType, Network, NetworkKind};
@@ -237,8 +253,9 @@ mod tests {
         let secp_sig = secp.sign_ecdsa_recoverable(&msg, &privkey);
         let signature = super::MessageSignature { signature: secp_sig, compressed: true };
 
+        assert_eq!(signature.to_string(), super::sign(&secp, message, privkey).to_string());
         assert_eq!(signature.to_base64(), signature.to_string());
-        let signature2 = super::MessageSignature::from_str(&signature.to_string()).unwrap();
+        let signature2 = &signature.to_string().parse::<super::MessageSignature>().unwrap();
         let pubkey = signature2
             .recover_pubkey(&secp, msg_hash)
             .unwrap()
@@ -247,12 +264,12 @@ mod tests {
 
         let p2pkh = Address::p2pkh(pubkey, NetworkKind::Main);
         assert_eq!(signature2.is_signed_by_address(&secp, &p2pkh, msg_hash), Ok(true));
-        let p2wpkh = Address::p2wpkh(&pubkey, Network::Bitcoin);
+        let p2wpkh = Address::p2wpkh(pubkey, Network::Bitcoin);
         assert_eq!(
             signature2.is_signed_by_address(&secp, &p2wpkh, msg_hash),
             Err(MessageSignatureError::UnsupportedAddressType(AddressType::P2wpkh))
         );
-        let p2shwpkh = Address::p2shwpkh(&pubkey, NetworkKind::Main);
+        let p2shwpkh = Address::p2shwpkh(pubkey, NetworkKind::Main);
         assert_eq!(
             signature2.is_signed_by_address(&secp, &p2shwpkh, msg_hash),
             Err(MessageSignatureError::UnsupportedAddressType(AddressType::P2sh))
@@ -261,6 +278,10 @@ mod tests {
         assert_eq!(signature2.is_signed_by_address(&secp, &p2pkh, msg_hash), Ok(true));
 
         assert_eq!(pubkey.0, secp256k1::PublicKey::from_secret_key(&secp, &privkey));
+        let signature_base64 = signature.to_base64();
+        let signature_round_trip =
+            super::MessageSignature::from_base64(&signature_base64).expect("message signature");
+        assert_eq!(signature, signature_round_trip);
     }
 
     #[test]

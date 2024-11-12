@@ -2,12 +2,11 @@
 
 //! Demonstrate creating a transaction that spends to and from p2wpkh outputs.
 
-use std::str::FromStr;
-
-use bitcoin::hashes::Hash;
+use bitcoin::address::script_pubkey::ScriptBufExt as _;
 use bitcoin::locktime::absolute;
 use bitcoin::secp256k1::{rand, Message, Secp256k1, SecretKey, Signing};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+use bitcoin::witness::WitnessExt as _;
 use bitcoin::{
     transaction, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
     Txid, WPubkeyHash, Witness,
@@ -29,13 +28,13 @@ fn main() {
 
     // Get an unspent output that is locked to the key above that we control.
     // In a real application these would come from the chain.
-    let (dummy_out_point, dummy_utxo) = dummy_unspent_transaction_output(&wpkh);
+    let (dummy_out_point, dummy_utxo) = dummy_unspent_transaction_output(wpkh);
 
     // The input for the transaction we are constructing.
     let input = TxIn {
         previous_output: dummy_out_point, // The dummy output we are spending.
         script_sig: ScriptBuf::default(), // For a p2wpkh script_sig is empty.
-        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+        sequence: Sequence::ENABLE_LOCKTIME_AND_RBF,
         witness: Witness::default(), // Filled in after signing.
     };
 
@@ -45,7 +44,7 @@ fn main() {
     // The change output is locked to a key controlled by us.
     let change = TxOut {
         value: CHANGE_AMOUNT,
-        script_pubkey: ScriptBuf::new_p2wpkh(&wpkh), // Change comes back to us.
+        script_pubkey: ScriptBuf::new_p2wpkh(wpkh), // Change comes back to us.
     };
 
     // The transaction we want to sign and broadcast.
@@ -61,7 +60,12 @@ fn main() {
     let sighash_type = EcdsaSighashType::All;
     let mut sighasher = SighashCache::new(&mut unsigned_tx);
     let sighash = sighasher
-        .p2wpkh_signature_hash(input_index, &dummy_utxo.script_pubkey, SPEND_AMOUNT, sighash_type)
+        .p2wpkh_signature_hash(
+            input_index,
+            &dummy_utxo.script_pubkey,
+            DUMMY_UTXO_AMOUNT,
+            sighash_type,
+        )
         .expect("failed to create sighash");
 
     // Sign the sighash using the secp256k1 library (exported by rust-bitcoin).
@@ -71,7 +75,7 @@ fn main() {
     // Update the witness stack.
     let signature = bitcoin::ecdsa::Signature { signature, sighash_type };
     let pk = sk.public_key(&secp);
-    *sighasher.witness_mut(input_index).unwrap() = Witness::p2wpkh(&signature, &pk);
+    *sighasher.witness_mut(input_index).unwrap() = Witness::p2wpkh(signature, pk);
 
     // Get the signed transaction.
     let tx = sighasher.into_transaction();
@@ -97,13 +101,14 @@ fn senders_keys<C: Signing>(secp: &Secp256k1<C>) -> (SecretKey, WPubkeyHash) {
 ///
 /// (FWIW this is a random mainnet address from block 80219.)
 fn receivers_address() -> Address {
-    Address::from_str("bc1q7cyrfmck2ffu2ud3rn5l5a8yv6f0chkp0zpemf")
+    "bc1q7cyrfmck2ffu2ud3rn5l5a8yv6f0chkp0zpemf"
+        .parse::<Address<_>>()
         .expect("a valid address")
         .require_network(Network::Bitcoin)
         .expect("valid address for mainnet")
 }
 
-/// Creates a p2wpkh output locked to the key associated with `wpkh`.
+/// Constructs a new p2wpkh output locked to the key associated with `wpkh`.
 ///
 /// An utxo is described by the `OutPoint` (txid and index within the transaction that it was
 /// created). Using the out point one can get the transaction by `txid` and using the `vout` get the
@@ -111,11 +116,11 @@ fn receivers_address() -> Address {
 ///
 /// This output is locked to keys that we control, in a real application this would be a valid
 /// output taken from a transaction that appears in the chain.
-fn dummy_unspent_transaction_output(wpkh: &WPubkeyHash) -> (OutPoint, TxOut) {
+fn dummy_unspent_transaction_output(wpkh: WPubkeyHash) -> (OutPoint, TxOut) {
     let script_pubkey = ScriptBuf::new_p2wpkh(wpkh);
 
     let out_point = OutPoint {
-        txid: Txid::all_zeros(), // Obviously invalid.
+        txid: Txid::from_byte_array([0xFF; 32]), // Arbitrary invalid dummy value.
         vout: 0,
     };
 

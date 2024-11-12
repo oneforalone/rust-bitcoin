@@ -4,16 +4,14 @@
 //!
 //! This module describes network messages which are used for passing
 //! Bitcoin data (blocks and transactions) around.
-//!
 
-use hashes::{sha256d, Hash as _};
 use io::{BufRead, Write};
 
-use crate::blockdata::block::BlockHash;
-use crate::blockdata::transaction::{Txid, Wtxid};
+use crate::block::BlockHash;
 use crate::consensus::encode::{self, Decodable, Encodable};
 use crate::internal_macros::impl_consensus_encoding;
 use crate::p2p;
+use crate::transaction::{Txid, Wtxid};
 
 /// An inventory item.
 #[derive(PartialEq, Eq, Clone, Debug, Copy, Hash, PartialOrd, Ord)]
@@ -68,11 +66,11 @@ impl Encodable for Inventory {
             };
         }
         Ok(match *self {
-            Inventory::Error => encode_inv!(0, sha256d::Hash::all_zeros()),
+            Inventory::Error => encode_inv!(0, [0; 32]),
             Inventory::Transaction(ref t) => encode_inv!(1, t),
             Inventory::Block(ref b) => encode_inv!(2, b),
             Inventory::CompactBlock(ref b) => encode_inv!(4, b),
-            Inventory::WTx(w) => encode_inv!(5, w),
+            Inventory::WTx(ref w) => encode_inv!(5, w),
             Inventory::WitnessTransaction(ref t) => encode_inv!(0x40000001, t),
             Inventory::WitnessBlock(ref b) => encode_inv!(0x40000002, b),
             Inventory::Unknown { inv_type: t, hash: ref d } => encode_inv!(t, d),
@@ -145,10 +143,9 @@ impl_consensus_encoding!(GetHeadersMessage, version, locator_hashes, stop_hash);
 
 #[cfg(test)]
 mod tests {
-    use hashes::Hash;
     use hex::test_hex_unwrap as hex;
 
-    use super::{GetBlocksMessage, GetHeadersMessage};
+    use super::*;
     use crate::consensus::encode::{deserialize, serialize};
 
     #[test]
@@ -162,7 +159,7 @@ mod tests {
         assert_eq!(real_decode.version, 70002);
         assert_eq!(real_decode.locator_hashes.len(), 1);
         assert_eq!(serialize(&real_decode.locator_hashes[0]), genhash);
-        assert_eq!(real_decode.stop_hash, Hash::all_zeros());
+        assert_eq!(real_decode.stop_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
 
         assert_eq!(serialize(&real_decode), from_sat);
     }
@@ -178,7 +175,7 @@ mod tests {
         assert_eq!(real_decode.version, 70002);
         assert_eq!(real_decode.locator_hashes.len(), 1);
         assert_eq!(serialize(&real_decode.locator_hashes[0]), genhash);
-        assert_eq!(real_decode.stop_hash, Hash::all_zeros());
+        assert_eq!(real_decode.stop_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
 
         assert_eq!(serialize(&real_decode), from_sat);
     }

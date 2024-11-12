@@ -4,22 +4,22 @@
 //!
 //! This module defines the `NetworkMessage` and `RawNetworkMessage` types that
 //! are used for (de)serializing Bitcoin objects for transmission on the network.
-//!
 
 use core::{fmt, iter};
 
-use hashes::{sha256d, Hash};
+use hashes::sha256d;
+use internals::ToU64 as _;
 use io::{BufRead, Write};
 
-use crate::blockdata::{block, transaction};
-use crate::consensus::encode::{self, CheckedData, Decodable, Encodable, VarInt};
+use crate::consensus::encode::{self, CheckedData, Decodable, Encodable, ReadExt, WriteExt};
 use crate::merkle_tree::MerkleBlock;
 use crate::p2p::address::{AddrV2Message, Address};
 use crate::p2p::{
     message_blockdata, message_bloom, message_compact_blocks, message_filter, message_network,
     Magic,
 };
-use crate::prelude::*;
+use crate::prelude::{Box, Cow, String, ToOwned, Vec};
+use crate::{block, consensus, transaction};
 
 /// The maximum number of [super::message_blockdata::Inventory] items in an `inv` message.
 ///
@@ -301,15 +301,19 @@ impl NetworkMessage {
 }
 
 impl RawNetworkMessage {
-    /// Creates a [RawNetworkMessage]
+    /// Constructs a new [RawNetworkMessage]
     pub fn new(magic: Magic, payload: NetworkMessage) -> Self {
         let mut engine = sha256d::Hash::engine();
         let payload_len = payload.consensus_encode(&mut engine).expect("engine doesn't error");
         let payload_len = u32::try_from(payload_len).expect("network message use u32 as length");
         let checksum = sha256d::Hash::from_engine(engine);
+        let checksum = checksum.to_byte_array();
         let checksum = [checksum[0], checksum[1], checksum[2], checksum[3]];
         Self { magic, payload, payload_len, checksum }
     }
+
+    /// Consumes the [RawNetworkMessage] instance and returns the inner payload.
+    pub fn into_payload(self) -> NetworkMessage { self.payload }
 
     /// The actual message data
     pub fn payload(&self) -> &NetworkMessage { &self.payload }
@@ -330,11 +334,11 @@ impl RawNetworkMessage {
 
 struct HeaderSerializationWrapper<'a>(&'a Vec<block::Header>);
 
-impl<'a> Encodable for HeaderSerializationWrapper<'a> {
+impl Encodable for HeaderSerializationWrapper<'_> {
     #[inline]
     fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         let mut len = 0;
-        len += VarInt::from(self.0.len()).consensus_encode(w)?;
+        len += w.emit_compact_size(self.0.len())?;
         for header in self.0.iter() {
             len += header.consensus_encode(w)?;
             len += 0u8.consensus_encode(w)?;
@@ -407,14 +411,14 @@ impl Decodable for HeaderDeserializationWrapper {
     fn consensus_decode_from_finite_reader<R: BufRead + ?Sized>(
         r: &mut R,
     ) -> Result<Self, encode::Error> {
-        let len = VarInt::consensus_decode(r)?.0;
+        let len = r.read_compact_size()?;
         // should be above usual number of items to avoid
         // allocation
         let mut ret = Vec::with_capacity(core::cmp::min(1024 * 16, len as usize));
         for _ in 0..len {
             ret.push(Decodable::consensus_decode(r)?);
             if u8::consensus_decode(r)? != 0u8 {
-                return Err(encode::Error::ParseFailed(
+                return Err(consensus::parse_failed_error(
                     "Headers message should not contain transactions",
                 ));
             }
@@ -424,7 +428,7 @@ impl Decodable for HeaderDeserializationWrapper {
 
     #[inline]
     fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
-        Self::consensus_decode_from_finite_reader(&mut r.take(MAX_MSG_SIZE as u64))
+        Self::consensus_decode_from_finite_reader(&mut r.take(MAX_MSG_SIZE.to_u64()))
     }
 }
 
@@ -529,7 +533,7 @@ impl Decodable for RawNetworkMessage {
 
     #[inline]
     fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
-        Self::consensus_decode_from_finite_reader(&mut r.take(MAX_MSG_SIZE as u64))
+        Self::consensus_decode_from_finite_reader(&mut r.take(MAX_MSG_SIZE.to_u64()))
     }
 }
 
@@ -537,16 +541,12 @@ impl Decodable for RawNetworkMessage {
 mod test {
     use std::net::Ipv4Addr;
 
-    use hashes::sha256d::Hash;
-    use hashes::Hash as HashTrait;
     use hex::test_hex_unwrap as hex;
+    use units::BlockHeight;
 
-    use super::message_network::{Reject, RejectReason, VersionMessage};
     use super::*;
     use crate::bip152::BlockTransactionsRequest;
-    use crate::blockdata::block::Block;
-    use crate::blockdata::script::ScriptBuf;
-    use crate::blockdata::transaction::Transaction;
+    use crate::block::Block;
     use crate::consensus::encode::{deserialize, deserialize_partial, serialize};
     use crate::p2p::address::AddrV2;
     use crate::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
@@ -555,9 +555,12 @@ mod test {
     use crate::p2p::message_filter::{
         CFCheckpt, CFHeaders, CFilter, GetCFCheckpt, GetCFHeaders, GetCFilters,
     };
+    use crate::p2p::message_network::{Reject, RejectReason, VersionMessage};
     use crate::p2p::ServiceFlags;
+    use crate::script::ScriptBuf;
+    use crate::transaction::Transaction;
 
-    fn hash(slice: [u8; 32]) -> Hash { Hash::from_slice(&slice).unwrap() }
+    fn hash(slice: [u8; 32]) -> sha256d::Hash { sha256d::Hash::from_slice(&slice).unwrap() }
 
     #[test]
     fn full_round_ser_der_raw_network_message_test() {
@@ -571,7 +574,7 @@ mod test {
         let cmptblock = deserialize(&hex!("00000030d923ad36ff2d955abab07f8a0a6e813bc6e066b973e780c5e36674cad5d1cd1f6e265f2a17a0d35cbe701fe9d06e2c6324cfe135f6233e8b767bfa3fb4479b71115dc562ffff7f2006000000000000000000000000010002000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0302ee00ffffffff0100f9029500000000015100000000")).unwrap();
         let blocktxn = deserialize(&hex!("2e93c0cff39ff605020072d96bc3a8d20b8447e294d08092351c8583e08d9b5a01020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff0402dc0000ffffffff0200f90295000000001976a9142b4569203694fc997e13f2c0a1383b9e16c77a0d88ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000")).unwrap();
 
-        let msgs = vec![
+        let msgs = [
             NetworkMessage::Version(version_msg),
             NetworkMessage::Verack,
             NetworkMessage::Addr(vec![(
@@ -611,7 +614,7 @@ mod test {
             NetworkMessage::FilterClear,
             NetworkMessage::GetCFilters(GetCFilters {
                 filter_type: 2,
-                start_height: 52,
+                start_height: BlockHeight::from(52),
                 stop_hash: hash([42u8; 32]).into(),
             }),
             NetworkMessage::CFilter(CFilter {
@@ -621,7 +624,7 @@ mod test {
             }),
             NetworkMessage::GetCFHeaders(GetCFHeaders {
                 filter_type: 4,
-                start_height: 102,
+                start_height: BlockHeight::from(102),
                 stop_hash: hash([47u8; 32]).into(),
             }),
             NetworkMessage::CFHeaders(CFHeaders {
@@ -683,7 +686,7 @@ mod test {
 
         // Test serializing.
         let cs = CommandString("Andrew".into());
-        assert_eq!(serialize(&cs), vec![0x41u8, 0x6e, 0x64, 0x72, 0x65, 0x77, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(serialize(&cs), [0x41u8, 0x6e, 0x64, 0x72, 0x65, 0x77, 0, 0, 0, 0, 0, 0]);
 
         // Test deserializing
         let cs: Result<CommandString, _> =
@@ -701,7 +704,7 @@ mod test {
     #[rustfmt::skip]
     fn serialize_verack_test() {
         assert_eq!(serialize(&RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::Verack)),
-                   vec![0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x61,
+                       [0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x61,
                         0x63, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                         0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2]);
     }
@@ -710,7 +713,7 @@ mod test {
     #[rustfmt::skip]
     fn serialize_ping_test() {
         assert_eq!(serialize(&RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::Ping(100))),
-                   vec![0xf9, 0xbe, 0xb4, 0xd9, 0x70, 0x69, 0x6e, 0x67,
+                       [0xf9, 0xbe, 0xb4, 0xd9, 0x70, 0x69, 0x6e, 0x67,
                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                         0x08, 0x00, 0x00, 0x00, 0x24, 0x67, 0xf1, 0x1d,
                         0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
@@ -720,7 +723,7 @@ mod test {
     #[rustfmt::skip]
     fn serialize_mempool_test() {
         assert_eq!(serialize(&RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::MemPool)),
-                   vec![0xf9, 0xbe, 0xb4, 0xd9, 0x6d, 0x65, 0x6d, 0x70,
+                       [0xf9, 0xbe, 0xb4, 0xd9, 0x6d, 0x65, 0x6d, 0x70,
                         0x6f, 0x6f, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00,
                         0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2]);
     }
@@ -729,7 +732,7 @@ mod test {
     #[rustfmt::skip]
     fn serialize_getaddr_test() {
         assert_eq!(serialize(&RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::GetAddr)),
-                   vec![0xf9, 0xbe, 0xb4, 0xd9, 0x67, 0x65, 0x74, 0x61,
+                       [0xf9, 0xbe, 0xb4, 0xd9, 0x67, 0x65, 0x74, 0x61,
                         0x64, 0x64, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
                         0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2]);
     }
@@ -742,8 +745,7 @@ mod test {
             0x64, 0x64, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2
         ]);
-        let preimage =
-            RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::GetAddr);
+        let preimage = RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::GetAddr);
         assert!(msg.is_ok());
         let msg: RawNetworkMessage = msg.unwrap();
         assert_eq!(preimage.magic, msg.magic);
@@ -790,7 +792,7 @@ mod test {
             assert_eq!(version_msg.start_height, 560275);
             assert!(version_msg.relay);
         } else {
-            panic!("Wrong message type");
+            panic!("wrong message type");
         }
     }
 
@@ -836,7 +838,7 @@ mod test {
             assert_eq!(version_msg.start_height, 560275);
             assert!(version_msg.relay);
         } else {
-            panic!("Wrong message type");
+            panic!("wrong message type");
         }
     }
 }

@@ -30,12 +30,14 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::str::FromStr;
 
+use bitcoin::address::script_pubkey::ScriptBufExt as _;
 use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint, IntoDerivationPath, Xpriv, Xpub};
 use bitcoin::consensus::encode;
+use bitcoin::consensus_validation::TransactionExt as _;
 use bitcoin::locktime::absolute;
 use bitcoin::psbt::{self, Input, Psbt, PsbtSighashType};
+use bitcoin::script::ScriptBufExt as _;
 use bitcoin::secp256k1::{Secp256k1, Signing, Verification};
 use bitcoin::{
     transaction, Address, Amount, CompressedPublicKey, Network, OutPoint, ScriptBuf, Sequence,
@@ -110,18 +112,18 @@ impl ColdStorage {
     ///
     /// The newly created signer along with the data needed to configure a watch-only wallet.
     fn new<C: Signing>(secp: &Secp256k1<C>, xpriv: &str) -> Result<ExportData> {
-        let master_xpriv = Xpriv::from_str(xpriv)?;
-        let master_xpub = Xpub::from_priv(secp, &master_xpriv);
+        let master_xpriv = xpriv.parse::<Xpriv>()?;
+        let master_xpub = Xpub::from_xpriv(secp, &master_xpriv);
 
         // Hardened children require secret data to derive.
 
         let path = "84h/0h/0h".into_derivation_path()?;
-        let account_0_xpriv = master_xpriv.derive_priv(secp, &path)?;
-        let account_0_xpub = Xpub::from_priv(secp, &account_0_xpriv);
+        let account_0_xpriv = master_xpriv.derive_xpriv(secp, &path);
+        let account_0_xpub = Xpub::from_xpriv(secp, &account_0_xpriv);
 
         let path = INPUT_UTXO_DERIVATION_PATH.into_derivation_path()?;
-        let input_xpriv = master_xpriv.derive_priv(secp, &path)?;
-        let input_xpub = Xpub::from_priv(secp, &input_xpriv);
+        let input_xpriv = master_xpriv.derive_xpriv(secp, &path);
+        let input_xpub = Xpub::from_xpriv(secp, &input_xpriv);
 
         let wallet = ColdStorage { master_xpriv, master_xpub };
         let fingerprint = wallet.master_fingerprint();
@@ -133,7 +135,11 @@ impl ColdStorage {
     fn master_fingerprint(&self) -> Fingerprint { self.master_xpub.fingerprint() }
 
     /// Signs `psbt` with this signer.
-    fn sign_psbt<C: Signing>(&self, secp: &Secp256k1<C>, mut psbt: Psbt) -> Result<Psbt> {
+    fn sign_psbt<C: Signing + Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+        mut psbt: Psbt,
+    ) -> Result<Psbt> {
         match psbt.sign(&self.master_xpriv, secp) {
             Ok(keys) => assert_eq!(keys.len(), 1),
             Err((_, e)) => {
@@ -167,13 +173,14 @@ impl WatchOnly {
         WatchOnly { account_0_xpub, input_xpub, master_fingerprint }
     }
 
-    /// Creates the PSBT, in BIP174 parlance this is the 'Creater'.
+    /// Creates the PSBT, in BIP174 parlance this is the 'Creator'.
     fn create_psbt<C: Verification>(&self, secp: &Secp256k1<C>) -> Result<Psbt> {
-        let to_address = Address::from_str(RECEIVE_ADDRESS)?.require_network(Network::Regtest)?;
-        let to_amount = Amount::from_str(OUTPUT_AMOUNT_BTC)?;
+        let to_address =
+            RECEIVE_ADDRESS.parse::<Address<_>>()?.require_network(Network::Regtest)?;
+        let to_amount = OUTPUT_AMOUNT_BTC.parse::<Amount>()?;
 
         let (_, change_address, _) = self.change_address(secp)?;
-        let change_amount = Amount::from_str(CHANGE_AMOUNT_BTC)?;
+        let change_amount = CHANGE_AMOUNT_BTC.parse::<Amount>()?;
 
         let tx = Transaction {
             version: transaction::Version::TWO,
@@ -199,10 +206,10 @@ impl WatchOnly {
     fn update_psbt(&self, mut psbt: Psbt) -> Result<Psbt> {
         let mut input = Input { witness_utxo: Some(previous_output()), ..Default::default() };
 
-        let pk = self.input_xpub.to_pub();
+        let pk = self.input_xpub.to_public_key();
         let wpkh = pk.wpubkey_hash();
 
-        let redeem_script = ScriptBuf::new_p2wpkh(&wpkh);
+        let redeem_script = ScriptBuf::new_p2wpkh(wpkh);
         input.redeem_script = Some(redeem_script);
 
         let fingerprint = self.master_fingerprint;
@@ -211,7 +218,7 @@ impl WatchOnly {
         map.insert(pk.0, (fingerprint, path));
         input.bip32_derivation = map;
 
-        let ty = PsbtSighashType::from_str("SIGHASH_ALL")?;
+        let ty = "SIGHASH_ALL".parse::<PsbtSighashType>()?;
         input.sighash_type = Some(ty);
 
         psbt.inputs = vec![input];
@@ -228,8 +235,8 @@ impl WatchOnly {
 
         let sigs: Vec<_> = psbt.inputs[0].partial_sigs.values().collect();
         let mut script_witness: Witness = Witness::new();
-        script_witness.push(&sigs[0].to_vec());
-        script_witness.push(self.input_xpub.to_pub().to_bytes());
+        script_witness.push(sigs[0].serialize());
+        script_witness.push(self.input_xpub.to_public_key().to_bytes());
 
         psbt.inputs[0].final_script_witness = Some(script_witness);
 
@@ -251,11 +258,11 @@ impl WatchOnly {
         &self,
         secp: &Secp256k1<C>,
     ) -> Result<(CompressedPublicKey, Address, DerivationPath)> {
-        let path = [ChildNumber::from_normal_idx(1)?, ChildNumber::from_normal_idx(0)?];
-        let derived = self.account_0_xpub.derive_pub(secp, &path)?;
+        let path = [ChildNumber::ONE_NORMAL, ChildNumber::ZERO_NORMAL];
+        let derived = self.account_0_xpub.derive_xpub(secp, &path)?;
 
-        let pk = derived.to_pub();
-        let addr = Address::p2wpkh(&pk, NETWORK);
+        let pk = derived.to_public_key();
+        let addr = Address::p2wpkh(pk, NETWORK);
         let path = path.into_derivation_path()?;
 
         Ok((pk, addr, path))
@@ -270,7 +277,7 @@ fn input_derivation_path() -> Result<DerivationPath> {
 fn previous_output() -> TxOut {
     let script_pubkey = ScriptBuf::from_hex(INPUT_UTXO_SCRIPT_PUBKEY)
         .expect("failed to parse input utxo scriptPubkey");
-    let amount = Amount::from_str(INPUT_UTXO_VALUE).expect("failed to parse input utxo value");
+    let amount = INPUT_UTXO_VALUE.parse::<Amount>().expect("failed to parse input utxo value");
 
     TxOut { value: amount, script_pubkey }
 }

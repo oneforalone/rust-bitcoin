@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! SHA512 implementation.
-//!
 
-use core::ops::Index;
-use core::slice::SliceIndex;
-use core::{cmp, str};
+use core::cmp;
 
-use crate::{FromSliceError, HashEngine as _};
+use crate::{incomplete_block_len, HashEngine as _};
 
-crate::internal_macros::hash_type! {
+crate::internal_macros::general_hash_type! {
     512,
     false,
     "Output of the SHA512 hash function."
@@ -18,20 +15,20 @@ crate::internal_macros::hash_type! {
 #[cfg(not(hashes_fuzz))]
 pub(crate) fn from_engine(mut e: HashEngine) -> Hash {
     // pad buffer with a single 1-bit then all 0s, until there are exactly 16 bytes remaining
-    let data_len = e.length as u64;
+    let n_bytes_hashed = e.bytes_hashed;
 
     let zeroes = [0; BLOCK_SIZE - 16];
     e.input(&[0x80]);
-    if e.length % BLOCK_SIZE > zeroes.len() {
+    if incomplete_block_len(&e) > zeroes.len() {
         e.input(&zeroes);
     }
-    let pad_length = zeroes.len() - (e.length % BLOCK_SIZE);
+    let pad_length = zeroes.len() - incomplete_block_len(&e);
     e.input(&zeroes[..pad_length]);
-    debug_assert_eq!(e.length % BLOCK_SIZE, zeroes.len());
+    debug_assert_eq!(incomplete_block_len(&e), zeroes.len());
 
     e.input(&[0; 8]);
-    e.input(&(8 * data_len).to_be_bytes());
-    debug_assert_eq!(e.length % BLOCK_SIZE, 0);
+    e.input(&(8 * n_bytes_hashed).to_be_bytes());
+    debug_assert_eq!(incomplete_block_len(&e), 0);
 
     Hash(e.midstate())
 }
@@ -49,44 +46,32 @@ pub(crate) const BLOCK_SIZE: usize = 128;
 #[derive(Clone)]
 pub struct HashEngine {
     h: [u64; 8],
-    length: usize,
+    bytes_hashed: u64,
     buffer: [u8; BLOCK_SIZE],
 }
 
-impl Default for HashEngine {
+impl HashEngine {
+    /// Constructs a new SHA512 hash engine.
     #[rustfmt::skip]
-    fn default() -> Self {
-        HashEngine {
+    pub const fn new() -> Self {
+        Self {
             h: [
                 0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
                 0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
             ],
-            length: 0,
+            bytes_hashed: 0,
             buffer: [0; BLOCK_SIZE],
         }
     }
+}
+
+impl Default for HashEngine {
+    fn default() -> Self { Self::new() }
 }
 
 impl HashEngine {
-    /// Constructs a hash engine suitable for use inside the default `sha512_256::HashEngine`.
-    #[rustfmt::skip]
-    pub(crate) fn sha512_256() -> Self {
-        HashEngine {
-            h: [
-                0x22312194fc2bf72c, 0x9f555fa3c84c64c2, 0x2393b86b6f53b151, 0x963877195940eabd,
-                0x96283ee2a88effe3, 0xbe5e1e2553863992, 0x2b0199fc2c85b8aa, 0x0eb72ddc81c52ca2,
-            ],
-            length: 0,
-            buffer: [0; BLOCK_SIZE],
-        }
-    }
-}
-
-impl crate::HashEngine for HashEngine {
-    type MidState = [u8; 64];
-
     #[cfg(not(hashes_fuzz))]
-    fn midstate(&self) -> [u8; 64] {
+    pub(crate) fn midstate(&self) -> [u8; 64] {
         let mut ret = [0; 64];
         for (val, ret_bytes) in self.h.iter().zip(ret.chunks_exact_mut(8)) {
             ret_bytes.copy_from_slice(&val.to_be_bytes());
@@ -95,17 +80,45 @@ impl crate::HashEngine for HashEngine {
     }
 
     #[cfg(hashes_fuzz)]
-    fn midstate(&self) -> [u8; 64] {
+    pub(crate) fn midstate(&self) -> [u8; 64] {
         let mut ret = [0; 64];
         ret.copy_from_slice(&self.buffer[..64]);
         ret
     }
 
+    /// Constructs a new hash engine suitable for use constructing a `sha512_256::HashEngine`.
+    #[rustfmt::skip]
+    pub(crate) const fn sha512_256() -> Self {
+        HashEngine {
+            h: [
+                0x22312194fc2bf72c, 0x9f555fa3c84c64c2, 0x2393b86b6f53b151, 0x963877195940eabd,
+                0x96283ee2a88effe3, 0xbe5e1e2553863992, 0x2b0199fc2c85b8aa, 0x0eb72ddc81c52ca2,
+            ],
+            bytes_hashed: 0,
+            buffer: [0; BLOCK_SIZE],
+        }
+    }
+
+    /// Constructs a new hash engine suitable for constructing a `sha384::HashEngine`.
+    #[rustfmt::skip]
+    pub(crate) const fn sha384() -> Self {
+        HashEngine {
+            h: [
+                0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939,
+                0x67332667ffc00b31, 0x8eb44a8768581511, 0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4,
+            ],
+            bytes_hashed: 0,
+            buffer: [0; BLOCK_SIZE],
+        }
+    }
+}
+
+impl crate::HashEngine for HashEngine {
     const BLOCK_SIZE: usize = 128;
 
-    fn n_bytes_hashed(&self) -> usize { self.length }
+    fn n_bytes_hashed(&self) -> u64 { self.bytes_hashed }
 
-    engine_input_impl!();
+    crate::internal_macros::engine_input_impl!();
 }
 
 #[allow(non_snake_case)]
@@ -295,21 +308,23 @@ mod tests {
     #[test]
     #[cfg(feature = "alloc")]
     fn test() {
-        use crate::{sha512, Hash, HashEngine};
+        use alloc::string::ToString;
+
+        use crate::{sha512, HashEngine};
 
         #[derive(Clone)]
         struct Test {
             input: &'static str,
-            output: Vec<u8>,
+            output: [u8; 64],
             output_str: &'static str,
         }
 
         #[rustfmt::skip]
-        let tests = vec![
+        let tests = [
             // Test vectors computed with `sha512sum`
             Test {
                 input: "",
-                output: vec![
+                output: [
                     0xcf, 0x83, 0xe1, 0x35, 0x7e, 0xef, 0xb8, 0xbd,
                     0xf1, 0x54, 0x28, 0x50, 0xd6, 0x6d, 0x80, 0x07,
                     0xd6, 0x20, 0xe4, 0x05, 0x0b, 0x57, 0x15, 0xdc,
@@ -323,7 +338,7 @@ mod tests {
             },
             Test {
                 input: "The quick brown fox jumps over the lazy dog",
-                output: vec![
+                output: [
                     0x07, 0xe5, 0x47, 0xd9, 0x58, 0x6f, 0x6a, 0x73,
                     0xf7, 0x3f, 0xba, 0xc0, 0x43, 0x5e, 0xd7, 0x69,
                     0x51, 0x21, 0x8f, 0xb7, 0xd0, 0xc8, 0xd7, 0x88,
@@ -337,7 +352,7 @@ mod tests {
             },
             Test {
                 input: "The quick brown fox jumps over the lazy dog.",
-                output: vec![
+                output: [
                     0x91, 0xea, 0x12, 0x45, 0xf2, 0x0d, 0x46, 0xae,
                     0x9a, 0x03, 0x7a, 0x98, 0x9f, 0x54, 0xf1, 0xf7,
                     0x90, 0xf0, 0xa4, 0x76, 0x07, 0xee, 0xb8, 0xa1,
@@ -355,8 +370,8 @@ mod tests {
             // Hash through high-level API, check hex encoding/decoding
             let hash = sha512::Hash::hash(test.input.as_bytes());
             assert_eq!(hash, test.output_str.parse::<sha512::Hash>().expect("parse hex"));
-            assert_eq!(&hash[..], &test.output[..]);
-            assert_eq!(&hash.to_string(), &test.output_str);
+            assert_eq!(hash.as_byte_array(), &test.output);
+            assert_eq!(hash.to_string(), test.output_str);
 
             // Hash through engine, checking that we can input byte by byte
             let mut engine = sha512::Hash::engine();
@@ -365,16 +380,16 @@ mod tests {
             }
             let manual_hash = sha512::Hash::from_engine(engine);
             assert_eq!(hash, manual_hash);
-            assert_eq!(hash.to_byte_array()[..].as_ref(), test.output.as_slice());
+            assert_eq!(hash.to_byte_array(), test.output);
         }
     }
 
-    #[cfg(feature = "serde")]
     #[test]
+    #[cfg(feature = "serde")]
     fn sha512_serde() {
         use serde_test::{assert_tokens, Configure, Token};
 
-        use crate::{sha512, Hash};
+        use crate::sha512;
 
         #[rustfmt::skip]
         static HASH_BYTES: [u8; 64] = [

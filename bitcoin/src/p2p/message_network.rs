@@ -4,19 +4,18 @@
 //!
 //! This module defines network messages which describe peers and their
 //! capabilities.
-//!
 
 use hashes::sha256d;
 use io::{BufRead, Write};
 
-use crate::consensus::{encode, Decodable, Encodable, ReadExt};
+use crate::consensus::{self, encode, Decodable, Encodable, ReadExt};
 use crate::internal_macros::impl_consensus_encoding;
+use crate::p2p;
 use crate::p2p::address::Address;
 use crate::p2p::ServiceFlags;
-use crate::prelude::*;
-use crate::p2p;
+use crate::prelude::{Cow, String};
 
-/// Some simple messages
+// Some simple messages
 
 /// The `version` message
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -127,7 +126,7 @@ impl Decodable for RejectReason {
             0x41 => RejectReason::Dust,
             0x42 => RejectReason::Fee,
             0x43 => RejectReason::Checkpoint,
-            _ => return Err(encode::Error::ParseFailed("unknown reject code")),
+            _ => return Err(consensus::parse_failed_error("unknown reject code")),
         })
     }
 }
@@ -149,12 +148,10 @@ impl_consensus_encoding!(Reject, message, ccode, reason, hash);
 
 #[cfg(test)]
 mod tests {
-    use hashes::sha256d;
     use hex::test_hex_unwrap as hex;
 
-    use super::{Reject, RejectReason, VersionMessage};
+    use super::*;
     use crate::consensus::encode::{deserialize, serialize};
-    use crate::p2p::ServiceFlags;
 
     #[test]
     fn version_message_test() {
