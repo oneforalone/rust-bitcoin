@@ -1,7 +1,5 @@
 use std::str::FromStr;
 
-use serde::Serialize;
-
 use bitcoin::bip32::Xpriv;
 use bitcoin::consensus::serialize;
 use bitcoin::hashes::Hash;
@@ -15,6 +13,7 @@ use bitcoin::{
     absolute, transaction, Amount, OutPoint, PublicKey, Sequence, TapNodeHash, Transaction, TxIn,
     TxOut, Txid, Witness, XOnlyPublicKey,
 };
+use serde::Serialize;
 
 fn main() {
     let secp = Secp256k1::new();
@@ -333,12 +332,8 @@ impl OrdinalsInscription {
         let envelope = create_envelope(mime, data, recipient)?;
         Ok(OrdinalsInscription { envelope })
     }
-    pub fn taproot_program(&self) -> &Script {
-        self.envelope.script.as_script()
-    }
-    pub fn spend_info(&self) -> &TaprootSpendInfo {
-        &self.envelope.spend_info
-    }
+    pub fn taproot_program(&self) -> &Script { self.envelope.script.as_script() }
+    pub fn spend_info(&self) -> &TaprootSpendInfo { &self.envelope.spend_info }
 }
 
 /// Creates an [Ordinals Inscription](https://docs.ordinals.com/inscriptions.html).
